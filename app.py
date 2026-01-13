@@ -10,7 +10,6 @@ from nba_api.stats.endpoints import playergamelog, leaguedashteamstats
 st.set_page_config(page_title="NBA Sharp Pro Hub", layout="wide", page_icon="🏀")
 
 def get_fatigue_score(df):
-    """Calculates the '3-in-4 nights' fatigue penalty."""
     if df.empty or len(df) < 3: return 1.0, "Fresh"
     df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
     recent_games = df.head(4)
@@ -24,7 +23,6 @@ def get_fatigue_score(df):
 
 @st.cache_data(ttl=3600)
 def load_nba_base_data():
-    """Loads league-wide defensive ratings for SoS multipliers."""
     try:
         team_stats_raw = leaguedashteamstats.LeagueDashTeamStats(
             measure_type_detailed_defense='Advanced', season='2025-26'
@@ -39,9 +37,7 @@ def load_nba_base_data():
 
 @st.cache_data(ttl=600)
 def get_player_data(player_full_name):
-    """Fetches player logs with robust name matching and season fallback."""
     nba_players = players.get_players()
-    # Robust search: Try exact first, then partial (solves Tatum/LeBron naming issues)
     player = [p for p in nba_players if p['full_name'].lower() == player_full_name.lower()]
     if not player:
         player = [p for p in nba_players if player_full_name.lower() in p['full_name'].lower()]
@@ -49,7 +45,6 @@ def get_player_data(player_full_name):
     if not player: return pd.DataFrame()
     p_id = player[0]['id']
     
-    # Season Fallback Logic: Try current, then previous if empty
     try:
         log = playergamelog.PlayerGameLog(player_id=p_id, season='2025-26').get_data_frames()[0]
         if log.empty:
@@ -64,13 +59,11 @@ def get_player_data(player_full_name):
     return log
 
 def get_h2h_performance(df, opponent_abbr, stat_cat):
-    """Filters history for specific opponent performance."""
     h2h_df = df[df['matchup'].str.contains(opponent_abbr)]
     if h2h_df.empty: return None
     return round(h2h_df[stat_cat].mean(), 1)
 
 def suggest_parlay_leg(player_name, stat_cat, confidence, star_out):
-    """Correlation logic for parlay recommendations."""
     if confidence < 60: return None
     if stat_cat == "assists":
         return {"leg": "Primary Scorer OVER Points", "reason": "High assists correlate with teammate efficiency."}
@@ -80,8 +73,22 @@ def suggest_parlay_leg(player_name, stat_cat, confidence, star_out):
         return {"leg": "Game Total UNDER", "reason": "High rebounds often follow low shooting percentages."}
     return {"leg": "Team Moneyline", "reason": "Model assumes peak player performance leads to a win."}
 
+# --- 2. MOMENTUM CALCULATOR ---
+def calculate_momentum(df, stat_cat):
+    """Returns the % difference between L5 and L20 averages."""
+    if len(df) < 10: return 0, "Insuff. Data"
+    l5 = df[stat_cat].head(5).mean()
+    l20 = df[stat_cat].head(20).mean()
+    diff_pct = ((l5 - l20) / l20) * 100
+    
+    if diff_pct > 10: status = "🔥 Trending Up"
+    elif diff_pct < -10: status = "❄️ Cooling Down"
+    else: status = "⚖️ Stable"
+    
+    return round(diff_pct, 1), status
+
 # --- 3. UI RENDERING ---
-st.title("🏀 NBA Sharp: Intelligence Hub (v2.2)")
+st.title("🏀 NBA Sharp: Intelligence Hub (v2.3)")
 sos_data = load_nba_base_data()
 
 with st.sidebar:
@@ -105,14 +112,17 @@ if not p_df.empty:
     fatigue_mult, fatigue_label = get_fatigue_score(p_df)
     stat_category = st.selectbox("Stat Category", ["points", "rebounds", "assists"])
     
+    # Momentum Logic
+    mom_val, mom_status = calculate_momentum(p_df, stat_category)
+
     # Calculation
     p_mean = p_df[stat_category].mean()
-    p_std = p_df[stat_category].std() if len(p_df) > 1 else 1.0
     sos_mult = sos_data.get(selected_opp, 1.0)
     pace_mult = {"Snail": 0.92, "Balanced": 1.0, "Track Meet": 1.08}[pace_script]
     usage_multiplier = 1.12 if star_out else 1.0
     blowout_risk = 0.90 if abs(spread) > 12.5 else 1.0
     
+    # Final Model Projection
     model_proj = p_mean * pace_mult * sos_mult * fatigue_mult * usage_multiplier * blowout_risk
 
     col_main, col_side = st.columns([2, 1])
@@ -125,7 +135,7 @@ if not p_df.empty:
         fig = go.Figure(go.Bar(x=[f"G{i+1}" for i in range(len(last_10))], y=last_10[stat_category], 
                                marker_color=['#00ff96' if h else '#4a4a4a' for h in last_10['hit']]))
         fig.add_hline(y=target_line, line_dash="dash", line_color="#ff4b4b", annotation_text=f"Sharp Line: {target_line}")
-        fig.update_layout(title=f"{selected_p}: {stat_category.upper()} History", template="plotly_dark", height=350)
+        fig.update_layout(title=f"{selected_p}: {stat_category.upper()} Trend (Last 10)", template="plotly_dark", height=350)
         st.plotly_chart(fig, use_container_width=True)
 
     with col_side:
@@ -142,16 +152,16 @@ if not p_df.empty:
             st.warning("⚖️ NEUTRAL / STAY AWAY")
         
         st.divider()
-        st.subheader("📋 Sharp Specs")
-        st.write(f"**Season Avg:** {round(p_mean, 1)}")
-        st.write(f"**Fatigue:** {fatigue_label}")
+        st.subheader("📋 Momentum & Specs")
+        # Visual Momentum Indicator
+        st.metric(label=f"{stat_category.title()} Momentum", value=f"{mom_val}%", delta=mom_status)
         
-        # H2H Addition
+        st.write(f"**Fatigue:** {fatigue_label}")
         h2h_avg = get_h2h_performance(p_df, selected_opp, stat_category)
         if h2h_avg: st.write(f"**H2H vs {selected_opp}:** {h2h_avg} {stat_category}")
         
-        st.write(f"**Confidence:** {int(confidence)}%")
+        st.write(f"**Confidence Score:** {int(confidence)}%")
 
-    st.caption("Model Version 2.2 | Data sourced via NBA_API with Situational Multipliers.")
+    st.caption("Model v2.3 | Momentum tracks L5 vs L20 average volatility.")
 else:
-    st.warning(f"Could not find data for {selected_p}. Ensure name is correct or try a different season.")
+    st.warning(f"Could not find data for {selected_p}.")
