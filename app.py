@@ -44,9 +44,7 @@ def get_player_data(player_full_name):
         'FGA': 'fga', 'FG_PCT': 'fg_pct', 'FTA': 'fta', 'TOV': 'tov'
     })
     log['pra'] = log['points'] + log['rebounds'] + log['assists']
-    # Usage Proxy Calculation
     log['usage'] = log['fga'] + (0.44 * log['fta']) + log['tov']
-    # Points Per Shot (Efficiency Metric)
     log['pps'] = log['points'] / log['fga'].replace(0, 1)
     return log
 
@@ -60,6 +58,13 @@ def run_monte_carlo(lambda_val, user_line, iterations=10000):
     results = [{"Stat Level": f"{l}+", "Hit Frequency": f"{(np.sum(simulated_games >= l)/iterations)*100:.1f}%"} 
                for l in sorted(list(set(levels)))]
     return pd.DataFrame(results), simulated_games
+
+def american_to_implied(odds):
+    """Converts American Odds (-110, +150) to implied probability percentage."""
+    if odds > 0:
+        return 100 / (odds + 100)
+    else:
+        return abs(odds) / (abs(odds) + 100)
 
 # --- 3. UI RENDERING ---
 st.title("🏀 NBA Sharp Pro Hub (v2.2)")
@@ -76,6 +81,10 @@ with st.sidebar:
     st.subheader("🎲 Manual Context Entry")
     stat_category = st.selectbox("Stat Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     user_line = st.number_input(f"Sportsbook Line", value=25.5 if stat_category=="points" else 5.5, step=0.5)
+    
+    # --- NEW: MARKET ODDS INPUT ---
+    market_odds = st.number_input("Market Odds (e.g. -110)", value=-110, step=5, help="Enter the odds from your sportsbook.")
+    
     selected_opp = st.selectbox("Opponent", sorted(list(sos_data.keys())))
     is_home = st.toggle("Home Game", value=True)
     is_b2b = st.toggle("Back-to-Back (Fatigue)")
@@ -95,13 +104,11 @@ if not p_df.empty:
     col_main, col_side = st.columns([2, 1])
 
     with col_main:
-        # Efficiency suggestions logic
         recent_pps = p_df['pps'].head(5).mean()
         season_pps = p_df['pps'].mean()
         
         st.subheader("📊 Volume vs. Efficiency Matrix")
         eff_fig = go.Figure()
-        # Adding game-by-game markers
         eff_fig.add_trace(go.Scatter(
             x=p_df['usage'].head(15), 
             y=p_df['pps'].head(15),
@@ -119,15 +126,14 @@ if not p_df.empty:
         )
         st.plotly_chart(eff_fig, use_container_width=True)
 
-        # Dashboard Insights
         c_ins1, c_ins2 = st.columns(2)
         with c_ins1:
             if recent_pps > season_pps * 1.1:
-                st.warning("⚠️ **Efficiency Warning**: Player is scoring at a much higher rate than usual. Regression to the mean (Lower Points) is likely.")
+                st.warning("⚠️ **Efficiency Warning**: Player is scoring at a much higher rate than usual. Regression to the mean is likely.")
             elif recent_pps < season_pps * 0.9:
-                st.success("✅ **Bounce Back Candidate**: Player is shooting poorly compared to season average. Expect an efficiency spike (Higher Points) soon.")
+                st.success("✅ **Bounce Back Candidate**: Player is shooting poorly compared to average. Expect an efficiency spike.")
             else:
-                st.info("ℹ️ **Stable Efficiency**: Player is performing exactly at their expected career levels.")
+                st.info("ℹ️ **Stable Efficiency**: Player is performing at their expected levels.")
 
         with c_ins2:
             avg_usage = p_df['usage'].mean()
@@ -157,11 +163,25 @@ if not p_df.empty:
     with col_side:
         st.subheader("📊 Model Output")
         st.metric("Sharp Projection", round(sharp_lambda, 1))
-        st.metric("Win Prob (Over)", f"{over_prob}%")
+        st.metric("Model Win Prob", f"{over_prob}%")
+        
+        # --- NEW: EDGE LOGIC ---
+        implied_prob = american_to_implied(market_odds) * 100
+        edge = over_prob - implied_prob
+        
         st.divider()
-        if over_prob > 60: st.success("🔥 **STRONG VALUE DETECTED: OVER**")
-        elif over_prob < 40: st.error("❄️ **STRONG VALUE DETECTED: UNDER**")
-        else: st.info("⚖️ **NEUTRAL: NO EDGE DETECTED**")
+        st.subheader("💰 Betting Edge")
+        st.metric("Market Implied", f"{round(implied_prob, 1)}%")
+        
+        if edge > 5:
+            st.success(f"💎 EDGE FOUND: +{round(edge, 1)}%")
+            st.write("**Strategy:** Model is much higher than market. Value on OVER.")
+        elif edge < -5:
+            st.error(f"🛑 EDGE FOUND: {round(edge, 1)}%")
+            st.write("**Strategy:** Model is much lower than market. Value on UNDER.")
+        else:
+            st.info("⚖️ NO CLEAR EDGE")
+            st.write("The market price matches the model within 5%.")
 
     st.caption(f"v2.2 efficiency map | Dataset: {len(p_df)} games | SOS: {round(sos_mult, 2)}")
 else:
