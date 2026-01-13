@@ -27,7 +27,7 @@ def load_nba_base_data():
 @st.cache_data(ttl=600)
 def get_player_data(player_full_name):
     nba_players = players.get_players()
-    # Match player exactly or partially
+    # Normalize naming for SGA and others
     match = [p for p in nba_players if p['full_name'].lower() == player_full_name.lower()]
     if not match:
         match = [p for p in nba_players if player_full_name.lower() in p['full_name'].lower()]
@@ -35,17 +35,18 @@ def get_player_data(player_full_name):
     if not match: return pd.DataFrame(), None
     p_id = match[0]['id']
     
-    # Try current season, fallback to last season if empty (common for early season/API lag)
     log = pd.DataFrame()
+    # Attempt multi-season fetch to handle API gaps
     for season in ['2025-26', '2024-25']:
         try:
             log = playergamelog.PlayerGameLog(player_id=p_id, season=season).get_data_frames()[0]
             if not log.empty: break
         except: continue
 
-    if log.empty: return pd.DataFrame(), None
+    # CRITICAL FIX: Check if log is empty before accessing columns
+    if log.empty:
+        return pd.DataFrame(), None
 
-    # Extraction of Team ID for automation
     team_id = log['TEAM_ID'].iloc[0]
     
     log = log.rename(columns={
@@ -58,28 +59,28 @@ def get_player_data(player_full_name):
 
 @st.cache_data(ttl=3600)
 def get_auto_context(team_id):
-    """Resilient Automation Logic for Home/Away and B2B."""
+    if not team_id: return True, False, "BOS"
     try:
         gamefinder = leaguegamefinder.LeagueGameFinder(team_id_nullable=team_id)
         games = gamefinder.get_data_frames()[0]
         games['GAME_DATE'] = pd.to_datetime(games['GAME_DATE'])
         
-        # Sort by date
         today = datetime.now()
         upcoming = games[games['GAME_DATE'] >= today].sort_values('GAME_DATE')
         past = games[games['GAME_DATE'] < today].sort_values('GAME_DATE', ascending=False)
         
-        if upcoming.empty: return True, False, "BOS" # Default
+        if upcoming.empty: return True, False, "BOS"
         
         next_g = upcoming.iloc[0]
         is_home = "vs." in next_g['MATCHUP']
-        # Extract the last 3 chars which represent the opponent (e.g., "OKC vs. LAL")
-        opp_abbr = next_g['MATCHUP'][-3:] 
+        # Safer opponent extraction
+        matchup_parts = next_g['MATCHUP'].split(' ')
+        opp_abbr = matchup_parts[-1] if len(matchup_parts) > 1 else "BOS"
         
         is_b2b = False
         if not past.empty:
             days_diff = (next_g['GAME_DATE'] - past.iloc[0]['GAME_DATE']).days
-            is_b2b = (days_diff <= 1)
+            is_b2b = days_diff <= 1
             
         return is_home, is_b2b, opp_abbr
     except: return True, False, "BOS"
@@ -95,7 +96,7 @@ def run_monte_carlo(lambda_val, user_line, iterations=10000):
     return pd.DataFrame(results), simulated_games
 
 # --- 3. UI RENDERING ---
-st.title("🏀 NBA Sharp: Auto-Pilot Suite (v3.1)")
+st.title("🏀 NBA Sharp: Auto-Pilot Suite (v3.2)")
 sos_data, _ = load_nba_base_data()
 
 with st.sidebar:
@@ -105,16 +106,20 @@ with st.sidebar:
     filtered = [p for p in all_names if search_query.lower() in p.lower()]
     selected_p = st.selectbox("Confirm Player", filtered if filtered else all_names)
     
+    # Fetch data and context with error-handling logic
     p_df, t_id = get_player_data(selected_p)
-    auto_home, auto_b2b, auto_opp = get_auto_context(t_id) if t_id else (True, False, "BOS")
+    auto_home, auto_b2b, auto_opp = get_auto_context(t_id)
 
     st.divider()
     st.subheader("🎲 Intelligence Controls")
     stat_category = st.selectbox("Stat Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     user_line = st.number_input(f"Sportsbook Line", value=25.5 if stat_category=="points" else 5.5, step=0.5)
     
-    # Auto-populated fields
-    selected_opp = st.selectbox("Opponent", sorted(list(sos_data.keys())), index=sorted(list(sos_data.keys())).index(auto_opp) if auto_opp in sos_data else 0)
+    # Validation for selectbox index
+    opp_list = sorted(list(sos_data.keys()))
+    opp_idx = opp_list.index(auto_opp) if auto_opp in opp_list else 0
+    
+    selected_opp = st.selectbox("Opponent", opp_list, index=opp_idx)
     is_home = st.toggle("Home Game", value=auto_home)
     is_b2b = st.toggle("Back-to-Back", value=auto_b2b)
     star_out = st.toggle("Star Teammate Out?")
@@ -125,24 +130,24 @@ if not p_df.empty:
     p_mean = p_df[stat_category].mean()
     sos_mult = sos_data.get(selected_opp, 1.0)
     pace_mult = {"Snail": 0.92, "Balanced": 1.0, "Track Meet": 1.08}[pace_script]
-    # Apply Model Weights
+    # Weightings for Home (3%) and B2B (-5%)
     sharp_lambda = p_mean * pace_mult * sos_mult * (1.15 if star_out else 1.0) * (1.03 if is_home else 0.97) * (0.95 if is_b2b else 1.0)
     over_prob = calculate_poisson_prob(sharp_lambda, user_line)
 
     col_main, col_side = st.columns([2, 1])
 
     with col_main:
-        # TREND CHART (Last 10)
-        st.subheader(f"📈 {selected_p} Trend: Last 10 Games")
+        # MOMENTUM CHART
+        st.subheader(f"📈 {selected_p} Trend (Last 10)")
         last_10 = p_df.head(10).iloc[::-1]
         trend_fig = go.Figure()
-        trend_fig.add_trace(go.Scatter(x=list(range(1, 11)), y=last_10[stat_category], mode='lines+markers', name='Actual', line=dict(color='#00ff96', width=3)))
+        trend_fig.add_trace(go.Scatter(x=list(range(1, len(last_10)+1)), y=last_10[stat_category], mode='lines+markers', line=dict(color='#00ff96', width=3)))
         trend_fig.add_hline(y=user_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Line")
-        trend_fig.update_layout(template="plotly_dark", height=300, margin=dict(l=20, r=20, t=40, b=20))
+        trend_fig.update_layout(template="plotly_dark", height=300, margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(trend_fig, use_container_width=True)
 
         # SIMULATION
-        st.subheader("🎲 Monte Carlo Simulation (10k trials)")
+        st.subheader("🎲 Monte Carlo Simulation")
         sim_df, sim_raw = run_monte_carlo(sharp_lambda, user_line)
         st.table(sim_df)
 
@@ -155,6 +160,6 @@ if not p_df.empty:
         if over_prob > 60: st.success("🔥 VALUE: OVER")
         elif over_prob < 40: st.error("❄️ VALUE: UNDER")
 
-    st.caption("v3.1 | Shai-Resilient Patch | Auto-Pilot Context")
+    st.caption("v3.2 | KeyError:TEAM_ID Patched | Auto-Pilot Context")
 else:
-    st.warning("Data not found. Try searching for 'Gilgeous-Alexander' specifically.")
+    st.warning("⚠️ Data could not be retrieved. The NBA API may be experiencing high traffic or the player name is misspelled.")
