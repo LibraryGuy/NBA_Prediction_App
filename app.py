@@ -44,7 +44,10 @@ def get_player_data(player_full_name):
         'FGA': 'fga', 'FG_PCT': 'fg_pct', 'FTA': 'fta', 'TOV': 'tov'
     })
     log['pra'] = log['points'] + log['rebounds'] + log['assists']
+    # Usage Proxy Calculation
     log['usage'] = log['fga'] + (0.44 * log['fta']) + log['tov']
+    # Points Per Shot (Efficiency Metric)
+    log['pps'] = log['points'] / log['fga'].replace(0, 1)
     return log
 
 # --- 2. ADVANCED LOGIC ENGINES ---
@@ -59,7 +62,7 @@ def run_monte_carlo(lambda_val, user_line, iterations=10000):
     return pd.DataFrame(results), simulated_games
 
 # --- 3. UI RENDERING ---
-st.title("🏀 NBA Sharp Pro Hub (v2.1)")
+st.title("🏀 NBA Sharp Pro Hub (v2.2)")
 sos_data, league_avg_drtg = load_nba_base_data()
 
 with st.sidebar:
@@ -92,6 +95,49 @@ if not p_df.empty:
     col_main, col_side = st.columns([2, 1])
 
     with col_main:
+        # Efficiency suggestions logic
+        recent_pps = p_df['pps'].head(5).mean()
+        season_pps = p_df['pps'].mean()
+        
+        st.subheader("📊 Volume vs. Efficiency Matrix")
+        eff_fig = go.Figure()
+        # Adding game-by-game markers
+        eff_fig.add_trace(go.Scatter(
+            x=p_df['usage'].head(15), 
+            y=p_df['pps'].head(15),
+            mode='markers+text',
+            text=p_df['points'].head(15),
+            textposition="top center",
+            marker=dict(size=12, color=p_df['points'], colorscale='Viridis', showscale=True),
+            name="Recent Games"
+        ))
+        eff_fig.update_layout(
+            template="plotly_dark", height=350,
+            xaxis_title="Usage Volume (Shots + TOV + FT)",
+            yaxis_title="Efficiency (Points Per Shot)",
+            margin=dict(l=20, r=20, t=20, b=20)
+        )
+        st.plotly_chart(eff_fig, use_container_width=True)
+
+        # Dashboard Insights
+        c_ins1, c_ins2 = st.columns(2)
+        with c_ins1:
+            if recent_pps > season_pps * 1.1:
+                st.warning("⚠️ **Efficiency Warning**: Player is scoring at a much higher rate than usual. Regression to the mean (Lower Points) is likely.")
+            elif recent_pps < season_pps * 0.9:
+                st.success("✅ **Bounce Back Candidate**: Player is shooting poorly compared to season average. Expect an efficiency spike (Higher Points) soon.")
+            else:
+                st.info("ℹ️ **Stable Efficiency**: Player is performing exactly at their expected career levels.")
+
+        with c_ins2:
+            avg_usage = p_df['usage'].mean()
+            current_usage = p_df['usage'].head(5).mean()
+            if current_usage > avg_usage:
+                st.write(f"📈 **Volume Trend**: Usage is UP (+{round(current_usage-avg_usage, 1)} possessions)")
+            else:
+                st.write(f"📉 **Volume Trend**: Usage is DOWN ({round(current_usage-avg_usage, 1)} possessions)")
+
+        st.divider()
         st.subheader("📈 Last 10 Games Performance")
         last_10 = p_df.head(10).iloc[::-1]
         trend_fig = go.Figure()
@@ -100,36 +146,13 @@ if not p_df.empty:
         trend_fig.update_layout(template="plotly_dark", height=300, margin=dict(l=20, r=20, t=20, b=20))
         st.plotly_chart(trend_fig, use_container_width=True)
 
-        # MONTE CARLO SECTION
         st.subheader("🎲 10,000 Game Monte Carlo Simulation")
         sim_df, sim_raw = run_monte_carlo(sharp_lambda, user_line)
-        
-        # New Simulation Chart
         mc_fig = go.Figure()
-        mc_fig.add_trace(go.Histogram(
-            x=sim_raw,
-            nbinsx=30,
-            name='Simulated Outcomes',
-            marker_color='#00ff96',
-            opacity=0.7,
-            histnorm='probability'
-        ))
+        mc_fig.add_trace(go.Histogram(x=sim_raw, nbinsx=30, marker_color='#00ff96', opacity=0.7, histnorm='probability'))
         mc_fig.add_vline(x=user_line, line_width=3, line_dash="dash", line_color="#ff4b4b", annotation_text="LINE")
-        mc_fig.update_layout(
-            template="plotly_dark",
-            height=300,
-            margin=dict(l=20, r=20, t=20, b=20),
-            xaxis_title=f"Projected {stat_category.capitalize()}",
-            yaxis_title="Probability",
-            showlegend=False
-        )
+        mc_fig.update_layout(template="plotly_dark", height=300, margin=dict(l=20, r=20, t=20, b=20), xaxis_title=f"Projected {stat_category.capitalize()}", showlegend=False)
         st.plotly_chart(mc_fig, use_container_width=True)
-
-        c1, c2 = st.columns(2)
-        with c1: st.table(sim_df)
-        with c2:
-            st.metric("Simulated Average", round(np.mean(sim_raw), 2))
-            st.write(f"**90th Percentile Outcome:** {np.percentile(sim_raw, 90)}")
 
     with col_side:
         st.subheader("📊 Model Output")
@@ -140,6 +163,6 @@ if not p_df.empty:
         elif over_prob < 40: st.error("❄️ **STRONG VALUE DETECTED: UNDER**")
         else: st.info("⚖️ **NEUTRAL: NO EDGE DETECTED**")
 
-    st.caption(f"v2.1 enhanced | Dataset: {len(p_df)} games | SOS: {round(sos_mult, 2)}")
+    st.caption(f"v2.2 efficiency map | Dataset: {len(p_df)} games | SOS: {round(sos_mult, 2)}")
 else:
     st.warning("Player data not found. Please confirm the name in the sidebar search.")
