@@ -3,16 +3,13 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import poisson
-from nba_api.stats.static import players
-from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, commonteamroster, boxscoretraditionalv2
+from nba_api.stats.static import players, teams
+from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, commonteamroster
 
-# --- APP CONFIG ---
-st.set_page_config(page_title="Sharp Pro Hub v4.5", layout="wide")
-
-# --- DATA ENGINE ---
-@st.cache_data(ttl=600)
-def find_players_fuzzy(name_query):
-    return [p for p in players.get_players() if name_query.lower() in p['full_name'].lower()]
+# --- 1. CORE ENGINE ---
+@st.cache_data(ttl=3600)
+def get_all_teams():
+    return {t['abbreviation']: t['id'] for t in teams.get_teams()}
 
 @st.cache_data(ttl=600)
 def get_player_stats(p_id):
@@ -27,91 +24,92 @@ def get_player_stats(p_id):
         return log, info['TEAM_ABBREVIATION'].iloc[0], info['POSITION'].iloc[0], info['HEIGHT'].iloc[0]
     except: return pd.DataFrame(), None, None, None
 
-# --- SIDEBAR CONTROLS ---
+# --- 2. LAYOUT & SIDEBAR ---
+st.set_page_config(page_title="Sharp Pro v4.6", layout="wide")
+team_map = get_all_teams()
+
 with st.sidebar:
-    st.title("🛡️ Pro Hub v4.5")
+    st.title("🛡️ Pro Hub v4.6")
     total_purse = st.number_input("Purse ($)", value=1000)
     kelly_mult = st.slider("Kelly Fraction", 0.1, 1.0, 0.5)
     st.divider()
-    injury_pos = st.selectbox("Key Injury Impact", ["None", "PG Out", "Center Out", "Wing Out"])
-    impact_map = {"None": 1.0, "PG Out": 1.12, "Center Out": 1.08, "Wing Out": 1.05}
-    current_impact = impact_map[injury_pos]
-    mode = st.radio("Mode", ["Single Player", "Team Scout", "Parlay", "Box Score Scraper"])
+    mode = st.radio("Switch View", ["Single Player", "Team Scout Radar", "Box Score Scraper"])
     stat_cat = st.selectbox("Stat Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
-    is_home = st.toggle("Home Game", value=True)
+    injury_impact = st.slider("Global Injury Boost %", 0, 25, 0) / 100 + 1.0
 
-# --- DASHBOARD LOGIC ---
+# --- 3. MODE: SINGLE PLAYER (COMMAND CENTER) ---
 if mode == "Single Player":
-    # 1. SEARCH ROW
     c_s1, c_s2, c_s3 = st.columns([2, 2, 1])
-    with c_s1: query = st.text_input("1. Search Name", "Alexandre Sarr")
+    with c_s1: query = st.text_input("Search Name", "Alexandre Sarr")
     with c_s2:
-        matches = find_players_fuzzy(query)
-        player_choice = st.selectbox("2. Confirm Identity", matches, format_func=lambda x: x['full_name'])
-    with c_s3: vol_boost = st.checkbox("Volatility (Rookie) Mode", value=True)
+        matches = [p for p in players.get_players() if query.lower() in p['full_name'].lower()]
+        player_choice = st.selectbox("Confirm Identity", matches, format_func=lambda x: x['full_name'])
+    with c_s3: vol_boost = st.checkbox("Volatility Mode", value=True)
 
     if player_choice:
         p_df, team_abbr, pos, height = get_player_stats(player_choice['id'])
-        p_mean = p_df[stat_cat].mean()
-        
-        # 2. TOP METRICS BAR (Fixed Missing Info)
-        st.divider()
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.write(f"**{player_choice['full_name']}**\n{team_abbr} | {pos}")
-        m2.metric("Season Avg", round(p_mean, 1))
-        m3.metric("Last Game", p_df[stat_cat].iloc[0])
-        m4.metric("Height", height)
-        m5.metric("Injury Boost", f"{int((current_impact-1)*100)}%")
+        if not p_df.empty:
+            p_mean = p_df[stat_cat].mean()
+            st.divider()
+            # Top Bar Metrics
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Player", f"{team_abbr} | {pos}")
+            m2.metric("Season Avg", round(p_mean, 1))
+            m3.metric("Last Game", p_df[stat_cat].iloc[0])
+            m4.metric("Height", height)
 
-        # 3. MARKET & BETTING ROW
-        st.markdown("### 📊 Market Analysis & Betting Strategy")
-        b1, b2, b3, b4 = st.columns(4)
-        open_line = b1.number_input("Opening Line", value=float(round(p_mean, 1)))
-        curr_line = b2.number_input("Current Vegas Line", value=float(round(p_mean, 1)))
-        
-        # Projection Logic
-        st_lambda = p_mean * (1.10 if vol_boost else 1.0) * current_impact
-        win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
-        
-        b3.metric("Win Prob", f"{round(win_p*100, 1)}%", delta=f"{round(curr_line-open_line, 1)} Move")
-        
-        # Kelly Stake
-        dec_odds = 1.91
-        k_f = ((dec_odds - 1) * win_p - (1 - win_p)) / (dec_odds - 1)
-        stake = max(0, round(k_f * total_purse * kelly_mult, 2))
-        b4.metric("Rec. Stake", f"${stake}", help="Based on Adjusted Kelly Criterion")
+            # Betting Row
+            b1, b2, b3 = st.columns([2, 1, 1])
+            curr_line = b1.number_input("Vegas Line", value=float(round(p_mean, 1)))
+            st_lambda = p_mean * (1.10 if vol_boost else 1.0) * injury_impact
+            win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
+            b2.metric("Win Prob", f"{round(win_p*100, 1)}%")
+            b3.metric("Rec. Stake", f"${round(total_purse * kelly_mult * 0.05, 2)}")
 
-        # 4. PERFORMANCE CHARTS (Middle Row)
-        st.divider()
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.write("**Recent Performance Trend (Last 10)**")
-            fig_t = go.Figure(go.Scatter(y=p_df[stat_cat].head(10).iloc[::-1], mode='lines+markers', line=dict(color='#00ff96', width=3)))
-            fig_t.add_hline(y=curr_line, line_dash="dash", line_color="red", annotation_text="Market")
-            fig_t.update_layout(template="plotly_dark", height=280, margin=dict(l=10,r=10,t=10,b=10))
-            st.plotly_chart(fig_t, use_container_width=True)
+            # Visuals
+            st.divider()
+            t_col, e_col = st.columns(2)
+            with t_col:
+                fig_t = go.Figure(go.Scatter(y=p_df[stat_cat].head(10).iloc[::-1], mode='lines+markers', line=dict(color='#00ff96')))
+                fig_t.update_layout(title="Last 10 Games", template="plotly_dark", height=300)
+                st.plotly_chart(fig_t, use_container_width=True)
+            with e_col:
+                fig_e = go.Figure(go.Scatter(x=p_df['usage'], y=p_df['pps'], mode='markers', marker=dict(color='#ffaa00')))
+                fig_e.update_layout(title="Efficiency Matrix", template="plotly_dark", height=300)
+                st.plotly_chart(fig_e, use_container_width=True)
+
+            st.write("### 🎯 Full-Scale Outcome Distribution")
+            sims = np.random.poisson(st_lambda, 10000)
+            fig_mc = go.Figure(go.Histogram(x=sims, nbinsx=35, marker_color='#00ff96', opacity=0.6))
+            fig_mc.add_vline(x=curr_line, line_color="red", line_dash="dash", line_width=4)
+            fig_mc.update_layout(template="plotly_dark", height=400)
+            st.plotly_chart(fig_mc, use_container_width=True)
+
+# --- 4. MODE: TEAM SCOUT RADAR (FIXED) ---
+elif mode == "Team Scout Radar":
+    st.header("🚀 Team Scout Radar")
+    sel_team = st.selectbox("Select Team to Scan", sorted(list(team_map.keys())))
+    
+    if st.button("Generate Roster Analysis"):
+        with st.spinner(f"Analyzing {sel_team} performance data..."):
+            roster = commonteamroster.CommonTeamRoster(team_id=team_map[sel_team]).get_data_frames()[0]
+            radar_data = []
             
-        with col_right:
-            st.write("**Efficiency Matrix (Usage vs PPS)**")
-            fig_e = go.Figure(go.Scatter(x=p_df['usage'], y=p_df['pps'], mode='markers', marker=dict(size=12, color='#ffaa00', opacity=0.7)))
-            fig_e.update_layout(template="plotly_dark", height=280, margin=dict(l=10,r=10,t=10,b=10), xaxis_title="Usage Volume", yaxis_title="Points Per Shot")
-            st.plotly_chart(fig_e, use_container_width=True)
-
-        # 5. FULL-WIDTH MONTE CARLO (Bottom Row)
-        st.divider()
-        st.write("### 🎯 Outcome Probability Distribution")
-        sims = np.random.poisson(st_lambda, 10000)
-        fig_mc = go.Figure(go.Histogram(x=sims, nbinsx=35, marker_color='#00ff96', opacity=0.6))
-        fig_mc.add_vline(x=curr_line, line_width=5, line_dash="dash", line_color="red", annotation_text="VEGAS LINE")
-        fig_mc.update_layout(
-            template="plotly_dark", 
-            height=450, 
-            xaxis_title=f"Projected {stat_cat.upper()}", 
-            yaxis_title="Frequency",
-            margin=dict(l=20, r=20, t=30, b=20)
-        )
-        st.plotly_chart(fig_mc, use_container_width=True)
-
-elif mode == "Box Score Scraper":
-    st.header("📋 Last Game Detailed Box Score")
-    # ... (Rest of modules remain available in the background) ...
+            for _, row in roster.head(8).iterrows(): # Top 8 players for speed
+                p_log, _, _, _ = get_player_stats(row['PLAYER_ID'])
+                if not p_log.empty:
+                    m = p_log[stat_cat].mean()
+                    proj = m * injury_impact
+                    prob = (1 - poisson.cdf(m - 0.5, proj)) * 100
+                    radar_data.append({"Player": row['PLAYER'], "Avg": round(m,1), "Proj": round(proj,1), "Edge%": round(prob, 1)})
+            
+            df_radar = pd.DataFrame(radar_data)
+            
+            # Display Table and Team Distribution
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                st.dataframe(df_radar, use_container_width=True)
+            with c2:
+                fig_radar = go.Figure(go.Bar(x=df_radar['Player'], y=df_radar['Edge%'], marker_color='#00ff96'))
+                fig_radar.update_layout(title="Win Probability by Player", template="plotly_dark", height=350)
+                st.plotly_chart(fig_radar, use_container_width=True)
