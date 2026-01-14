@@ -13,20 +13,40 @@ st.set_page_config(page_title="NBA Sharp Pro Hub", layout="wide", page_icon="�
 
 @st.cache_data(ttl=3600)
 def load_nba_base_data():
+    # Complete list of all 30 NBA Team IDs as a ultimate safety net
+    all_nba_teams = {
+        'ATL': 1610612737, 'BOS': 1610612738, 'CLE': 1610612739, 'NOP': 1610612740,
+        'CHI': 1610612741, 'DAL': 1610612742, 'DEN': 1610612743, 'GSW': 1610612744,
+        'HOU': 1610612745, 'LAC': 1610612746, 'LAL': 1610612747, 'MIA': 1610612748,
+        'MIL': 1610612749, 'MIN': 1610612750, 'BKN': 1610612751, 'NYK': 1610612752,
+        'ORL': 1610612753, 'IND': 1610612754, 'PHI': 1610612755, 'PHX': 1610612756,
+        'POR': 1610612757, 'SAC': 1610612758, 'SAS': 1610612759, 'OKC': 1610612760,
+        'TOR': 1610612761, 'UTA': 1610612762, 'MEM': 1610612763, 'WAS': 1610612764,
+        'DET': 1610612765, 'CHA': 1610612766
+    }
+    
     try:
+        # Attempt to get data for the most recent completed/active season (2024-25)
+        # 2025-26 is often too early for the stats API to respond with valid JSON
         team_stats_raw = leaguedashteamstats.LeagueDashTeamStats(
-            measure_type_detailed_defense='Advanced', season='2025-26'
+            measure_type_detailed_defense='Advanced', season='2024-25'
         ).get_data_frames()[0]
+        
         nba_teams = teams.get_teams()
         id_to_abbr = {t['id']: t['abbreviation'] for t in nba_teams}
-        abbr_to_id = {t['abbreviation']: t['id'] for t in nba_teams}
         avg_drtg = team_stats_raw['DEF_RATING'].mean()
+        
         sos_map = {id_to_abbr[row['TEAM_ID']]: (row['DEF_RATING'] * 0.8 + avg_drtg * 0.2) / avg_drtg 
                    for _, row in team_stats_raw.iterrows() if id_to_abbr.get(row['TEAM_ID'])}
-        return sos_map, abbr_to_id
-    except:
-        fallback_teams = ["BOS", "GSW", "LAL", "OKC", "DET", "MIL", "PHX", "DAL", "NYK", "PHI"]
-        return {t: 1.0 for t in fallback_teams}, {"BOS": 1610612738, "GSW": 1610612744}
+        
+        # If SOS map is empty, trigger fallback
+        if not sos_map: raise ValueError("Empty Stats")
+        return sos_map, all_nba_teams
+        
+    except Exception as e:
+        # Fallback logic: Use all 30 teams with a neutral 1.0 SOS multiplier
+        sos_map = {abbr: 1.0 for abbr in all_nba_teams.keys()}
+        return sos_map, all_nba_teams
 
 @st.cache_data(ttl=600)
 def get_player_data(player_input, is_id=False):
@@ -43,15 +63,17 @@ def get_player_data(player_input, is_id=False):
     try:
         info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
         team_abbr = info['TEAM_ABBREVIATION'].iloc[0]
+        # Check current season, fall back to previous if empty
         log = playergamelog.PlayerGameLog(player_id=p_id, season='2025-26').get_data_frames()[0]
         if log.empty:
             log = playergamelog.PlayerGameLog(player_id=p_id, season='2024-25').get_data_frames()[0]
     except: return pd.DataFrame(), None, None
 
-    log = log.rename(columns={'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'FGA': 'fga', 'FG_PCT': 'fg_pct', 'FTA': 'fta', 'TOV': 'tov'})
-    log['pra'] = log['points'] + log['rebounds'] + log['assists']
-    log['usage'] = log['fga'] + (0.44 * log['fta']) + log['tov']
-    log['pps'] = log['points'] / log['fga'].replace(0, 1)
+    if not log.empty:
+        log = log.rename(columns={'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'FGA': 'fga', 'FG_PCT': 'fg_pct', 'FTA': 'fta', 'TOV': 'tov'})
+        log['pra'] = log['points'] + log['rebounds'] + log['assists']
+        log['usage'] = log['fga'] + (0.44 * log['fta']) + log['tov']
+        log['pps'] = log['points'] / log['fga'].replace(0, 1)
     return log, p_id, team_abbr
 
 # --- 2. ENGINES ---
@@ -75,7 +97,7 @@ def american_to_decimal(odds):
     return (odds / 100) + 1 if odds > 0 else (100 / abs(odds)) + 1
 
 # --- 3. UI RENDERING ---
-st.title("🏀 NBA Sharp Pro Hub (v2.7)")
+st.title("🏀 NBA Sharp Pro Hub (v2.8)")
 sos_data, abbr_to_id = load_nba_base_data()
 
 if 'auto_opp' not in st.session_state: st.session_state.auto_opp = "BOS"
@@ -94,16 +116,20 @@ with st.sidebar:
         selected_p = st.selectbox("Confirm Player", filtered if filtered else ["No Player Found"])
         p_df, p_id, team_abbr = get_player_data(selected_p)
     else:
-        selected_team_abbr = st.selectbox("Select Team", sorted(list(abbr_to_id.keys())))
+        selected_team_abbr = st.selectbox("Select Team to Scout", sorted(list(abbr_to_id.keys())))
         p_df = pd.DataFrame() 
 
     st.subheader("🎲 Game Context")
     stat_category = st.selectbox("Stat Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     
     opp_options = sorted(list(sos_data.keys()))
-    opp_idx = opp_options.index(st.session_state.auto_opp) if st.session_state.auto_opp in opp_options else 0
+    # Improved index lookup safety
+    try:
+        opp_idx = opp_options.index(st.session_state.auto_opp)
+    except:
+        opp_idx = 0
+        
     selected_opp = st.selectbox("Opponent", opp_options, index=opp_idx)
-    
     is_home = st.toggle("Home Game", value=st.session_state.auto_home)
     is_b2b = st.toggle("Back-to-Back", value=st.session_state.auto_b2b)
     star_out = st.toggle("Star Teammate Out?")
@@ -113,7 +139,7 @@ with st.sidebar:
         st.divider()
         st.subheader("🏦 Bankroll Management")
         user_line = st.number_input(f"Sportsbook Line", value=float(round(p_df[stat_category].mean(), 1)), step=0.5)
-        market_odds = st.number_input("Market Odds (e.g. -110)", value=-110, step=5)
+        market_odds = st.number_input("Market Odds", value=-110, step=5)
         bankroll = st.number_input("Total Bankroll ($)", value=1000, step=100)
         kelly_mode = st.select_slider("Kelly Fraction", options=["Quarter", "Half", "Full"], value="Half")
         kelly_mult = {"Quarter": 0.25, "Half": 0.5, "Full": 1.0}[kelly_mode]
@@ -144,33 +170,24 @@ if mode == "Single Player" and not p_df.empty:
     with col_main:
         st.info(f"🔗 **Live Intel for {selected_p}:** [Injury Report](https://www.rotowire.com/basketball/nba-lineups.php) | [Line Movement](https://www.vegasinsider.com/nba/odds/player-props/)")
         
-        # 1. Volume vs Efficiency Matrix
+        # Performance Viz
         st.subheader("📊 Volume vs. Efficiency Matrix")
-        eff_fig = go.Figure()
-        eff_fig.add_trace(go.Scatter(
-            x=p_df['usage'].head(15), y=p_df['pps'].head(15), 
-            mode='markers+text', text=p_df['points'].head(15), 
-            textposition="top center", 
-            marker=dict(size=12, color=p_df['points'], colorscale='Viridis', showscale=True)
-        ))
-        eff_fig.update_layout(template="plotly_dark", height=300, margin=dict(l=20, r=20, t=20, b=20), xaxis_title="Usage Volume", yaxis_title="Efficiency (PPS)")
+        eff_fig = go.Figure(go.Scatter(x=p_df['usage'].head(15), y=p_df['pps'].head(15), mode='markers+text', text=p_df['points'].head(15), textposition="top center", marker=dict(size=12, color=p_df['points'], colorscale='Viridis', showscale=True)))
+        eff_fig.update_layout(template="plotly_dark", height=300, xaxis_title="Usage Volume", yaxis_title="Efficiency (PPS)")
         st.plotly_chart(eff_fig, use_container_width=True)
 
-        # 2. Last 10 Trend
         st.subheader("📈 Last 10 Games Performance")
         last_10 = p_df.head(10).iloc[::-1]
-        trend_fig = go.Figure()
-        trend_fig.add_trace(go.Scatter(x=list(range(1, 11)), y=last_10[stat_category], mode='lines+markers', name='Actual', line=dict(color='#00ff96', width=3)))
+        trend_fig = go.Figure(go.Scatter(x=list(range(1, 11)), y=last_10[stat_category], mode='lines+markers', line=dict(color='#00ff96', width=3)))
         trend_fig.add_hline(y=user_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Vegas Line")
-        trend_fig.update_layout(template="plotly_dark", height=250, margin=dict(l=20, r=20, t=20, b=20))
+        trend_fig.update_layout(template="plotly_dark", height=250)
         st.plotly_chart(trend_fig, use_container_width=True)
 
-        # 3. Monte Carlo Histogram
-        st.subheader("🎲 10,000 Game Monte Carlo Simulation")
+        st.subheader("🎲 Monte Carlo Simulation")
         sim_df, sim_raw = run_monte_carlo(sharp_lambda, user_line)
         mc_fig = go.Figure(go.Histogram(x=sim_raw, nbinsx=30, marker_color='#00ff96', opacity=0.7, histnorm='probability'))
-        mc_fig.add_vline(x=user_line, line_width=3, line_dash="dash", line_color="#ff4b4b", annotation_text="LINE")
-        mc_fig.update_layout(template="plotly_dark", height=250, margin=dict(l=20, r=20, t=20, b=20), xaxis_title=f"Projected {stat_category.capitalize()}", showlegend=False)
+        mc_fig.add_vline(x=user_line, line_width=3, line_dash="dash", line_color="#ff4b4b")
+        mc_fig.update_layout(template="plotly_dark", height=250, xaxis_title=f"Projected {stat_category.capitalize()}")
         st.plotly_chart(mc_fig, use_container_width=True)
 
     with col_side:
@@ -180,23 +197,16 @@ if mode == "Single Player" and not p_df.empty:
         
         implied_prob = american_to_implied(market_odds) * 100
         edge = over_prob - implied_prob
-        st.divider()
-        st.subheader("💰 Market Edge")
         st.metric("Market Implied", f"{round(implied_prob, 1)}%", delta=f"{round(edge, 1)}% Edge")
         
-        # Kelly Recommendation Calculation
         dec_odds = american_to_decimal(market_odds)
-        b = dec_odds - 1
-        p = over_prob / 100
-        q = 1 - p
-        kelly_f = (b * p - q) / b if b > 0 else 0
-        suggested_stake = max(0, kelly_f * bankroll * kelly_mult)
+        kelly_f = ((dec_odds - 1) * (over_prob / 100) - (1 - (over_prob / 100))) / (dec_odds - 1) if dec_odds > 1 else 0
+        stake = max(0, kelly_f * bankroll * kelly_mult)
         
         st.divider()
         st.subheader("🎯 Kelly Recommendation")
-        if edge > 0 and suggested_stake > 0:
-            st.header(f"${round(suggested_stake, 2)}")
-            st.caption(f"Bet {round(kelly_f * kelly_mult * 100, 2)}% of bankroll.")
+        if edge > 0 and stake > 0:
+            st.header(f"${round(stake, 2)}")
             st.success("🔥 VALUE DETECTED")
         else:
             st.header("$0.00")
@@ -207,29 +217,26 @@ elif mode == "Team Scout Radar":
     if st.button("🚀 Run Team Scan"):
         t_id = abbr_to_id.get(selected_team_abbr)
         if t_id:
-            with st.status("Scanning Roster...", expanded=True) as status:
-                roster = commonteamroster.CommonTeamRoster(team_id=t_id).get_data_frames()[0].head(10)
+            with st.status(f"Scanning {selected_team_abbr} Roster...", expanded=True) as status:
+                # Top 10 roster members
+                roster_data = commonteamroster.CommonTeamRoster(team_id=t_id).get_data_frames()[0].head(10)
                 results = []
-                for _, row in roster.iterrows():
-                    t_df, _, _ = get_player_data(row['PLAYER_ID'], is_id=True)
+                for _, row in roster_data.iterrows():
+                    p_name, p_id_roster = row['PLAYER'], row['PLAYER_ID']
+                    t_df, _, _ = get_player_data(p_id_roster, is_id=True)
                     if not t_df.empty:
                         t_mean = t_df[stat_category].mean()
                         t_proj = calculate_sharp_lambda(t_mean, pace_mult, sos_mult, star_out, is_home, is_b2b)
-                        results.append({
-                            "Player": row['PLAYER'],
-                            "Avg": round(t_mean, 1),
-                            "Proj": round(t_proj, 1),
-                            "Bump": round(t_proj - t_mean, 1)
-                        })
-                    time.sleep(0.1)
-                status.update(label="Scan Complete!", state="complete")
+                        results.append({"Player": p_name, "Avg": round(t_mean, 1), "Proj": round(t_proj, 1), "Bump": round(t_proj - t_mean, 1)})
+                    time.sleep(0.15)
+                status.update(label="Radar Scan Complete!", state="complete")
 
             res_df = pd.DataFrame(results).sort_values(by="Bump", ascending=False)
             try:
                 st.dataframe(res_df.style.background_gradient(subset=['Bump'], cmap='RdYlGn'), use_container_width=True)
-            except ImportError:
+            except:
                 st.dataframe(res_df, use_container_width=True)
             
             radar_fig = go.Figure(go.Bar(x=res_df['Player'], y=res_df['Bump'], marker_color='#00ff96'))
-            radar_fig.update_layout(template="plotly_dark", title=f"Contextual Impact on {stat_category.upper()}")
+            radar_fig.update_layout(template="plotly_dark", title=f"Situational Impact: {selected_team_abbr}")
             st.plotly_chart(radar_fig, use_container_width=True)
