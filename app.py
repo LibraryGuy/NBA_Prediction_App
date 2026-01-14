@@ -60,14 +60,15 @@ def run_monte_carlo(lambda_val, user_line, iterations=10000):
     return pd.DataFrame(results), simulated_games
 
 def american_to_implied(odds):
-    """Converts American Odds (-110, +150) to implied probability percentage."""
-    if odds > 0:
-        return 100 / (odds + 100)
-    else:
-        return abs(odds) / (abs(odds) + 100)
+    if odds > 0: return 100 / (odds + 100)
+    else: return abs(odds) / (abs(odds) + 100)
+
+def american_to_decimal(odds):
+    if odds > 0: return (odds / 100) + 1
+    else: return (100 / abs(odds)) + 1
 
 # --- 3. UI RENDERING ---
-st.title("🏀 NBA Sharp Pro Hub (v2.2)")
+st.title("🏀 NBA Sharp Pro Hub (v2.3)")
 sos_data, league_avg_drtg = load_nba_base_data()
 
 with st.sidebar:
@@ -81,15 +82,19 @@ with st.sidebar:
     st.subheader("🎲 Manual Context Entry")
     stat_category = st.selectbox("Stat Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     user_line = st.number_input(f"Sportsbook Line", value=25.5 if stat_category=="points" else 5.5, step=0.5)
-    
-    # --- NEW: MARKET ODDS INPUT ---
-    market_odds = st.number_input("Market Odds (e.g. -110)", value=-110, step=5, help="Enter the odds from your sportsbook.")
-    
+    market_odds = st.number_input("Market Odds (e.g. -110)", value=-110, step=5)
     selected_opp = st.selectbox("Opponent", sorted(list(sos_data.keys())))
     is_home = st.toggle("Home Game", value=True)
     is_b2b = st.toggle("Back-to-Back (Fatigue)")
     star_out = st.toggle("Star Teammate Out?")
     pace_script = st.select_slider("Expected Pace", options=["Snail", "Balanced", "Track Meet"], value="Balanced")
+
+    # --- NEW: BANKROLL MANAGEMENT ---
+    st.divider()
+    st.subheader("🏦 Bankroll Management")
+    bankroll = st.number_input("Total Bankroll ($)", value=1000, step=100)
+    kelly_mode = st.select_slider("Kelly Fraction", options=["Quarter", "Half", "Full"], value="Half")
+    kelly_mult = {"Quarter": 0.25, "Half": 0.5, "Full": 1.0}[kelly_mode]
 
 # --- 4. DATA PROCESSING ---
 p_df = get_player_data(selected_p)
@@ -104,6 +109,7 @@ if not p_df.empty:
     col_main, col_side = st.columns([2, 1])
 
     with col_main:
+        # Efficiency suggestions logic
         recent_pps = p_df['pps'].head(5).mean()
         season_pps = p_df['pps'].mean()
         
@@ -118,30 +124,18 @@ if not p_df.empty:
             marker=dict(size=12, color=p_df['points'], colorscale='Viridis', showscale=True),
             name="Recent Games"
         ))
-        eff_fig.update_layout(
-            template="plotly_dark", height=350,
-            xaxis_title="Usage Volume (Shots + TOV + FT)",
-            yaxis_title="Efficiency (Points Per Shot)",
-            margin=dict(l=20, r=20, t=20, b=20)
-        )
+        eff_fig.update_layout(template="plotly_dark", height=350, margin=dict(l=20, r=20, t=20, b=20), xaxis_title="Usage Volume", yaxis_title="Efficiency (PPS)")
         st.plotly_chart(eff_fig, use_container_width=True)
 
         c_ins1, c_ins2 = st.columns(2)
         with c_ins1:
-            if recent_pps > season_pps * 1.1:
-                st.warning("⚠️ **Efficiency Warning**: Player is scoring at a much higher rate than usual. Regression to the mean is likely.")
-            elif recent_pps < season_pps * 0.9:
-                st.success("✅ **Bounce Back Candidate**: Player is shooting poorly compared to average. Expect an efficiency spike.")
-            else:
-                st.info("ℹ️ **Stable Efficiency**: Player is performing at their expected levels.")
-
+            if recent_pps > season_pps * 1.1: st.warning("⚠️ **Efficiency Warning**: Regression likely.")
+            elif recent_pps < season_pps * 0.9: st.success("✅ **Bounce Back Candidate**: Efficiency spike expected.")
+            else: st.info("ℹ️ **Stable Efficiency**: Performing at career levels.")
         with c_ins2:
             avg_usage = p_df['usage'].mean()
             current_usage = p_df['usage'].head(5).mean()
-            if current_usage > avg_usage:
-                st.write(f"📈 **Volume Trend**: Usage is UP (+{round(current_usage-avg_usage, 1)} possessions)")
-            else:
-                st.write(f"📉 **Volume Trend**: Usage is DOWN ({round(current_usage-avg_usage, 1)} possessions)")
+            st.write(f"📈 **Volume Trend**: {'UP' if current_usage > avg_usage else 'DOWN'} ({round(current_usage-avg_usage, 1)} poss)")
 
         st.divider()
         st.subheader("📈 Last 10 Games Performance")
@@ -165,24 +159,39 @@ if not p_df.empty:
         st.metric("Sharp Projection", round(sharp_lambda, 1))
         st.metric("Model Win Prob", f"{over_prob}%")
         
-        # --- NEW: EDGE LOGIC ---
         implied_prob = american_to_implied(market_odds) * 100
         edge = over_prob - implied_prob
         
         st.divider()
-        st.subheader("💰 Betting Edge")
-        st.metric("Market Implied", f"{round(implied_prob, 1)}%")
+        st.subheader("💰 Market Edge")
+        st.metric("Market Implied", f"{round(implied_prob, 1)}%", delta=f"{round(edge, 1)}% Edge")
         
-        if edge > 5:
-            st.success(f"💎 EDGE FOUND: +{round(edge, 1)}%")
-            st.write("**Strategy:** Model is much higher than market. Value on OVER.")
-        elif edge < -5:
-            st.error(f"🛑 EDGE FOUND: {round(edge, 1)}%")
-            st.write("**Strategy:** Model is much lower than market. Value on UNDER.")
+        # --- KELLY CALCULATION ---
+        dec_odds = american_to_decimal(market_odds)
+        b = dec_odds - 1
+        p = over_prob / 100
+        q = 1 - p
+        
+        # Kelly Formula: f* = (bp - q) / b
+        if b > 0:
+            kelly_f = (b * p - q) / b
         else:
-            st.info("⚖️ NO CLEAR EDGE")
-            st.write("The market price matches the model within 5%.")
+            kelly_f = 0
+            
+        suggested_stake = max(0, kelly_f * bankroll * kelly_mult)
+        
+        st.divider()
+        st.subheader("🎯 Kelly Recommendation")
+        if edge > 0 and suggested_stake > 0:
+            st.write(f"Suggested Stake ({kelly_mode} Kelly):")
+            st.header(f"${round(suggested_stake, 2)}")
+            st.caption(f"Bet {round(kelly_f * kelly_mult * 100, 2)}% of your ${bankroll} bankroll.")
+            st.success("🔥 **VALUE DETECTED**")
+        else:
+            st.header("$0.00")
+            st.error("❌ **NO MATHEMATICAL EDGE**")
+            st.write("The model suggests the risk outweighs the potential reward at these odds.")
 
-    st.caption(f"v2.2 efficiency map | Dataset: {len(p_df)} games | SOS: {round(sos_mult, 2)}")
+    st.caption(f"v2.3 bankroll edition | Dataset: {len(p_df)} games | SOS: {round(sos_mult, 2)}")
 else:
     st.warning("Player data not found. Please confirm the name in the sidebar search.")
