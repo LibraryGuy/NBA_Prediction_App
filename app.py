@@ -5,9 +5,9 @@ import plotly.graph_objects as go
 import time
 from scipy.stats import poisson
 from nba_api.stats.static import players, teams
-from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, commonteamroster
+from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, commonteamroster, boxscoretraditionalv2
 
-# --- 1. CORE DATA ENGINE ---
+# --- 1. CORE DATA & ENHANCED LOGIC ---
 @st.cache_data(ttl=3600)
 def load_nba_universe():
     all_30 = {
@@ -40,137 +40,123 @@ def get_player_data(player_input, is_id=False):
     try:
         info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
         team_abbr = info['TEAM_ABBREVIATION'].iloc[0]
+        pos = info['POSITION'].iloc[0]
         log = playergamelog.PlayerGameLog(player_id=p_id, season='2025-26').get_data_frames()[0]
         if not log.empty:
             log = log.rename(columns={'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'FGA': 'fga', 'FTA': 'fta', 'TOV': 'tov'})
             log['pra'] = log['points'] + log['rebounds'] + log['assists']
             log['usage'] = log['fga'] + (0.44 * log['fta']) + log['tov']
             log['pps'] = log['points'] / log['fga'].replace(0, 1)
-        return log, p_id, team_abbr
-    except: return pd.DataFrame(), None, None
+        return log, p_id, team_abbr, pos
+    except: return pd.DataFrame(), None, None, None
 
-def calculate_sharp_lambda(p_mean, pace, sos, star, home, b2b):
-    return p_mean * pace * sos * (1.15 if star else 1.0) * (1.03 if home else 0.97) * (0.95 if b2b else 1.0)
+def calculate_sharp_lambda(p_mean, pace, sos, star, home, b2b, injury_impact):
+    # Base Model * External Factors * Injury Modifier
+    return p_mean * pace * sos * (1.15 if star else 1.0) * (1.03 if home else 0.97) * (0.95 if b2b else 1.0) * injury_impact
 
 # --- 2. UI LAYOUT & SIDEBAR ---
-st.set_page_config(page_title="Sharp Pro v3.4", layout="wide", page_icon="🏦")
+st.set_page_config(page_title="Sharp Pro Hub v4.0", layout="wide", page_icon="📈")
 sos_data, team_map = load_nba_universe()
 
 with st.sidebar:
-    st.header("💰 Bankroll & Staking")
-    total_purse = st.number_input("Starting Purse ($)", value=1000, step=50)
+    st.header("🏦 Bankroll & Odds")
+    total_purse = st.number_input("Starting Purse ($)", value=1000)
     kelly_multiplier = st.slider("Kelly Fraction", 0.1, 1.0, 0.5)
     st.divider()
     
+    st.header("🩹 Injury Impact")
+    injury_pos = st.selectbox("Key Player Out (Position)", ["None", "Point Guard", "Center", "Wing/Forward"])
+    impact_map = {"None": 1.0, "Point Guard": 1.12, "Center": 1.08, "Wing/Forward": 1.05}
+    current_impact = impact_map[injury_pos]
+    st.caption(f"Positional Boost: {round((current_impact-1)*100)}% for related stats.")
+
     st.header("🎯 System Mode")
-    mode = st.radio("View", ["Single Player", "Team Scout Radar", "Parlay Builder"])
+    mode = st.radio("Switch View", ["Single Player", "Team Scout Radar", "Parlay Builder", "Box Score Scraper"])
     st.divider()
     stat_cat = st.selectbox("Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
-    selected_opp = st.selectbox("Opponent", sorted(list(team_map.keys())), index=0)
+    selected_opp = st.selectbox("Opponent", sorted(list(team_map.keys())))
     is_home = st.toggle("Home Game", value=True)
-    is_b2b = st.toggle("Back-to-Back")
-    star_out = st.toggle("Star Teammate Out?")
     pace_mult = st.select_slider("Pace", options=[0.92, 1.0, 1.08], value=1.0)
 
-# --- 3. SINGLE PLAYER DASHBOARD ---
+# --- 3. SINGLE PLAYER DASHBOARD + LINE TRACKER ---
 if mode == "Single Player":
     search_q = st.text_input("Player Search", "Jalen Brunson")
-    p_df, p_id, team_abbr = get_player_data(search_q)
+    p_df, p_id, team_abbr, p_pos = get_player_data(search_q)
     
     if not p_df.empty:
         p_mean = p_df[stat_cat].mean()
-        sharp_lambda = calculate_sharp_lambda(p_mean, pace_mult, sos_data.get(selected_opp, 1.0), star_out, is_home, is_b2b)
+        sharp_lambda = calculate_sharp_lambda(p_mean, pace_mult, sos_data.get(selected_opp, 1.0), False, is_home, False, current_impact)
         
-        col_bet1, col_bet2 = st.columns(2)
-        user_line = col_bet1.number_input("Vegas Line", value=float(round(p_mean, 1)), step=0.5)
-        market_odds = col_bet2.number_input("Odds (American)", value=-110)
+        # Line Movement Tracker Simulation (Opening vs Current)
+        c1, c2 = st.columns(2)
+        opening_line = c1.number_input("Opening Line", value=float(round(p_mean, 1)))
+        current_line = c2.number_input("Current Vegas Line", value=float(round(p_mean, 1)))
+        
+        movement = current_line - opening_line
+        if movement > 0: st.warning(f"⚠️ Line moved UP {movement} pts (Sharp Action Detected)")
+        elif movement < 0: st.info(f"📉 Line moved DOWN {abs(movement)} pts")
 
         main_col, side_col = st.columns([2, 1])
         with main_col:
-            st.subheader("📈 Last 10 Games Trend")
-            last_10 = p_df.head(10).iloc[::-1]
-            trend_fig = go.Figure(go.Scatter(x=list(range(1, 11)), y=last_10[stat_cat], mode='lines+markers', line=dict(color='#00ff96', width=4)))
-            trend_fig.add_hline(y=user_line, line_dash="dash", line_color="red")
+            st.subheader("📈 Last 10 Trend & Market Line")
+            trend_fig = go.Figure(go.Scatter(x=list(range(1, 11)), y=p_df[stat_cat].head(10).iloc[::-1], mode='lines+markers', line=dict(color='#00ff96')))
+            trend_fig.add_hline(y=current_line, line_dash="dash", line_color="red", annotation_text="Current Market")
             trend_fig.update_layout(template="plotly_dark", height=300)
             st.plotly_chart(trend_fig, use_container_width=True)
 
-            st.subheader("📊 Efficiency Matrix")
-            eff_fig = go.Figure(go.Scatter(x=p_df['usage'].head(15), y=p_df['pps'].head(15), mode='markers', marker=dict(size=12, color=p_df['points'], colorscale='Viridis')))
-            eff_fig.update_layout(template="plotly_dark", xaxis_title="Usage", yaxis_title="PPS", height=350)
-            st.plotly_chart(eff_fig, use_container_width=True)
-
         with side_col:
-            st.subheader("🎲 Probability")
-            st.metric("Sharp Projection", round(sharp_lambda, 1))
-            over_prob = round((1 - poisson.cdf(user_line - 0.5, sharp_lambda)) * 100, 1)
-            st.metric("Win Probability", f"{over_prob}%")
-            
-            # Kelly Logic
-            dec_odds = (market_odds / 100) + 1 if market_odds > 0 else (100 / abs(market_odds)) + 1
-            win_p = over_prob / 100
-            k_f = ( (dec_odds-1)*win_p - (1-win_p) ) / (dec_odds-1) if dec_odds > 1 else 0
+            st.subheader("🎲 Betting Logic")
+            win_p = (1 - poisson.cdf(current_line - 0.5, sharp_lambda))
+            st.metric("Win Probability", f"{round(win_p * 100, 1)}%")
+            # Kelly with Purse
+            odds = -110
+            dec_odds = 1.91
+            k_f = ((dec_odds - 1) * win_p - (1 - win_p)) / (dec_odds - 1)
             st.metric("Suggested Stake", f"${max(0, round(k_f * total_purse * kelly_multiplier, 2))}")
 
-# --- 4. TEAM SCOUT RADAR ---
-elif mode == "Team Scout Radar":
-    team_to_scout = st.selectbox("Select Team", sorted(list(team_map.keys())), index=0)
-    if st.button(f"🚀 Scan {team_to_scout} Roster"):
-        t_id = team_map[team_to_scout]
-        with st.status("Analyzing Matchup...") as s:
-            roster = commonteamroster.CommonTeamRoster(team_id=t_id).get_data_frames()[0].head(10)
-            results = []
-            for _, row in roster.iterrows():
-                p_log, _, _ = get_player_data(row['PLAYER_ID'], is_id=True)
-                if not p_log.empty:
-                    m = p_log[stat_cat].mean()
-                    p = calculate_sharp_lambda(m, pace_mult, sos_data.get(selected_opp, 1.0), star_out, is_home, is_b2b)
-                    prob = round((1 - poisson.cdf(m - 0.5, p)) * 100, 1)
-                    results.append({"Player": row['PLAYER'], "Avg": round(m,1), "Proj": round(p,1), "Edge": round(p-m,1), "Hit%": prob})
-            s.update(label="Scan Complete", state="complete")
-        
-        st.session_state['radar_results'] = pd.DataFrame(results).sort_values("Edge", ascending=False)
-        st.table(st.session_state['radar_results'])
+# --- 4. BOX SCORE SCRAPER ---
+elif mode == "Box Score Scraper":
+    st.subheader("📋 Last Game Deep-Dive")
+    search_q = st.text_input("Enter Player Name", "Jalen Brunson")
+    p_df, p_id, team_abbr, p_pos = get_player_data(search_q)
+    
+    if p_id:
+        last_game_id = p_df.iloc[0]['Game_ID']
+        try:
+            box = boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=last_game_id).get_data_frames()[0]
+            player_stats = box[box['PLAYER_ID'] == p_id]
+            st.write(f"### Last Game Stats vs {p_df.iloc[0]['MATCHUP']}")
+            st.table(player_stats[['MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'FG_PCT']])
+        except:
+            st.error("Could not fetch detailed box score for this game.")
 
-# --- 5. PARLAY BUILDER (NEW FEATURE) ---
+# --- 5. PARLAY BUILDER ---
 elif mode == "Parlay Builder":
-    st.subheader("🔗 Multi-Leg Parlay Optimizer")
+    st.subheader("🔗 Multi-Leg Optimizer")
     if 'radar_results' not in st.session_state:
-        st.warning("Please run a 'Team Scout Radar' scan first to populate available legs.")
+        st.warning("Run a 'Team Scout Radar' scan first.")
     else:
-        available_players = st.session_state['radar_results']['Player'].tolist()
-        selections = st.multiselect("Select Legs for Parlay", available_players)
-        
+        selections = st.multiselect("Select Legs", st.session_state['radar_results']['Player'].tolist())
         if selections:
-            parlay_prob = 1.0
-            total_decimal_odds = 1.0
-            
-            st.write("### Parlay Composition")
+            parlay_p = 1.0
             for player in selections:
                 row = st.session_state['radar_results'][st.session_state['radar_results']['Player'] == player].iloc[0]
-                p_win = row['Hit%'] / 100
-                parlay_prob *= p_win
-                
-                # Assume standard -110 juice for each leg unless specified
-                leg_odds = st.number_input(f"Odds for {player} Over {row['Avg']}", value=-110, key=f"odds_{player}")
-                dec_leg = (leg_odds / 100) + 1 if leg_odds > 0 else (100 / abs(leg_odds)) + 1
-                total_decimal_odds *= dec_leg
-                
-                st.write(f"✅ **{player}**: {row['Hit%']}% Win Prob | {leg_odds} Odds")
-            
-            st.divider()
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Parlay Win Prob", f"{round(parlay_prob * 100, 2)}%")
-            
-            # Convert decimal back to American for display
-            parlay_american = round((total_decimal_odds - 1) * 100) if total_decimal_odds >= 2 else round(-100 / (total_decimal_odds - 1))
-            c2.metric("Combined Odds", f"{parlay_american}")
-            
-            # Parlay Kelly
-            p_k_f = ( (total_decimal_odds-1)*parlay_prob - (1-parlay_prob) ) / (total_decimal_odds-1)
-            parlay_stake = max(0, p_k_f * total_purse * kelly_multiplier)
-            c3.metric("Suggested Stake", f"${round(parlay_stake, 2)}")
-            
-            if parlay_prob * total_decimal_odds > 1.0:
-                st.success("🔥 This parlay has positive Expected Value (+EV)!")
-            else:
-                st.error("⚠️ Negative Expected Value. The juice outweighs the probability.")
+                parlay_p *= (row['Hit%'] / 100)
+            st.metric("Parlay Win Prob", f"{round(parlay_p * 100, 2)}%")
+            st.metric("Recommended Parlay Stake", f"${round(parlay_p * 0.05 * total_purse, 2)}") # Simple fractional parlay Kelly
+
+# --- 6. TEAM SCOUT RADAR ---
+elif mode == "Team Scout Radar":
+    team_to_scout = st.selectbox("Select Team", sorted(list(team_map.keys())))
+    if st.button(f"🚀 Scan {team_to_scout} Roster"):
+        results = []
+        roster = commonteamroster.CommonTeamRoster(team_id=team_map[team_to_scout]).get_data_frames()[0].head(8)
+        for _, row in roster.iterrows():
+            p_log, _, _, _ = get_player_data(row['PLAYER_ID'], is_id=True)
+            if not p_log.empty:
+                m = p_log[stat_cat].mean()
+                proj = calculate_sharp_lambda(m, pace_mult, sos_data.get(selected_opp, 1.0), False, is_home, False, current_impact)
+                prob = round((1 - poisson.cdf(m - 0.5, proj)) * 100, 1)
+                results.append({"Player": row['PLAYER'], "Avg": round(m,1), "Proj": round(proj,1), "Edge": round(proj-m,1), "Hit%": prob})
+        st.session_state['radar_results'] = pd.DataFrame(results)
+        st.table(st.session_state['radar_results'])
