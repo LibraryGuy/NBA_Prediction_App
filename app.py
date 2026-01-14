@@ -21,7 +21,6 @@ def load_nba_base_data():
         id_to_abbr = {t['id']: t['abbreviation'] for t in nba_teams}
         abbr_to_id = {t['abbreviation']: t['id'] for t in nba_teams}
         avg_drtg = team_stats_raw['DEF_RATING'].mean()
-        
         sos_map = {id_to_abbr[row['TEAM_ID']]: (row['DEF_RATING'] * 0.8 + avg_drtg * 0.2) / avg_drtg 
                    for _, row in team_stats_raw.iterrows() if id_to_abbr.get(row['TEAM_ID'])}
         return sos_map, abbr_to_id
@@ -69,8 +68,14 @@ def run_monte_carlo(lambda_val, user_line, iterations=10000):
                for l in sorted(list(set(levels)))]
     return pd.DataFrame(results), simulated_games
 
+def american_to_implied(odds):
+    return 100 / (odds + 100) if odds > 0 else abs(odds) / (abs(odds) + 100)
+
+def american_to_decimal(odds):
+    return (odds / 100) + 1 if odds > 0 else (100 / abs(odds)) + 1
+
 # --- 3. UI RENDERING ---
-st.title("🏀 NBA Sharp Pro Hub")
+st.title("🏀 NBA Sharp Pro Hub (v2.7)")
 sos_data, abbr_to_id = load_nba_base_data()
 
 if 'auto_opp' not in st.session_state: st.session_state.auto_opp = "BOS"
@@ -104,6 +109,27 @@ with st.sidebar:
     star_out = st.toggle("Star Teammate Out?")
     pace_script = st.select_slider("Expected Pace", options=["Snail", "Balanced", "Track Meet"], value="Balanced")
 
+    if mode == "Single Player" and not p_df.empty:
+        st.divider()
+        st.subheader("🏦 Bankroll Management")
+        user_line = st.number_input(f"Sportsbook Line", value=float(round(p_df[stat_category].mean(), 1)), step=0.5)
+        market_odds = st.number_input("Market Odds (e.g. -110)", value=-110, step=5)
+        bankroll = st.number_input("Total Bankroll ($)", value=1000, step=100)
+        kelly_mode = st.select_slider("Kelly Fraction", options=["Quarter", "Half", "Full"], value="Half")
+        kelly_mult = {"Quarter": 0.25, "Half": 0.5, "Full": 1.0}[kelly_mode]
+
+        if st.button("🚀 Auto-Fill Game Context"):
+            try:
+                next_g = playernextngames.PlayerNextNGames(player_id=p_id, number_of_games=1).get_data_frames()[0]
+                if not next_g.empty:
+                    st.session_state.auto_home = (next_g['HOME_TEAM_ABBREVIATION'].iloc[0] == team_abbr)
+                    st.session_state.auto_opp = next_g['VISITOR_TEAM_ABBREVIATION'].iloc[0] if st.session_state.auto_home else next_g['HOME_TEAM_ABBREVIATION'].iloc[0]
+                    last_date = datetime.strptime(p_df['GAME_DATE'].iloc[0], '%b %d, %Y')
+                    next_date = datetime.strptime(next_g['GAME_DATE'].iloc[0], '%b %d, %Y')
+                    st.session_state.auto_b2b = ((next_date - last_date).days == 1)
+                    st.rerun()
+            except: st.error("Schedule fetch failed.")
+
 # --- 4. MAIN DASHBOARD ---
 sos_mult = sos_data.get(selected_opp, 1.0)
 pace_mult = {"Snail": 0.92, "Balanced": 1.0, "Track Meet": 1.08}[pace_script]
@@ -111,20 +137,70 @@ pace_mult = {"Snail": 0.92, "Balanced": 1.0, "Track Meet": 1.08}[pace_script]
 if mode == "Single Player" and not p_df.empty:
     p_mean = p_df[stat_category].mean()
     sharp_lambda = calculate_sharp_lambda(p_mean, pace_mult, sos_mult, star_out, is_home, is_b2b)
-    
+    over_prob = calculate_poisson_prob(sharp_lambda, user_line)
+
     col_main, col_side = st.columns([2, 1])
+    
     with col_main:
-        # Last 10 Trend
+        st.info(f"🔗 **Live Intel for {selected_p}:** [Injury Report](https://www.rotowire.com/basketball/nba-lineups.php) | [Line Movement](https://www.vegasinsider.com/nba/odds/player-props/)")
+        
+        # 1. Volume vs Efficiency Matrix
+        st.subheader("📊 Volume vs. Efficiency Matrix")
+        eff_fig = go.Figure()
+        eff_fig.add_trace(go.Scatter(
+            x=p_df['usage'].head(15), y=p_df['pps'].head(15), 
+            mode='markers+text', text=p_df['points'].head(15), 
+            textposition="top center", 
+            marker=dict(size=12, color=p_df['points'], colorscale='Viridis', showscale=True)
+        ))
+        eff_fig.update_layout(template="plotly_dark", height=300, margin=dict(l=20, r=20, t=20, b=20), xaxis_title="Usage Volume", yaxis_title="Efficiency (PPS)")
+        st.plotly_chart(eff_fig, use_container_width=True)
+
+        # 2. Last 10 Trend
+        st.subheader("📈 Last 10 Games Performance")
         last_10 = p_df.head(10).iloc[::-1]
         trend_fig = go.Figure()
-        trend_fig.add_trace(go.Scatter(x=list(range(1, 11)), y=last_10[stat_category], mode='lines+markers', line=dict(color='#00ff96', width=3)))
-        trend_fig.update_layout(template="plotly_dark", height=300, title=f"Last 10: {stat_category.capitalize()}")
+        trend_fig.add_trace(go.Scatter(x=list(range(1, 11)), y=last_10[stat_category], mode='lines+markers', name='Actual', line=dict(color='#00ff96', width=3)))
+        trend_fig.add_hline(y=user_line, line_dash="dash", line_color="#ff4b4b", annotation_text="Vegas Line")
+        trend_fig.update_layout(template="plotly_dark", height=250, margin=dict(l=20, r=20, t=20, b=20))
         st.plotly_chart(trend_fig, use_container_width=True)
+
+        # 3. Monte Carlo Histogram
+        st.subheader("🎲 10,000 Game Monte Carlo Simulation")
+        sim_df, sim_raw = run_monte_carlo(sharp_lambda, user_line)
+        mc_fig = go.Figure(go.Histogram(x=sim_raw, nbinsx=30, marker_color='#00ff96', opacity=0.7, histnorm='probability'))
+        mc_fig.add_vline(x=user_line, line_width=3, line_dash="dash", line_color="#ff4b4b", annotation_text="LINE")
+        mc_fig.update_layout(template="plotly_dark", height=250, margin=dict(l=20, r=20, t=20, b=20), xaxis_title=f"Projected {stat_category.capitalize()}", showlegend=False)
+        st.plotly_chart(mc_fig, use_container_width=True)
 
     with col_side:
         st.subheader("📊 Model Output")
         st.metric("Sharp Projection", round(sharp_lambda, 1))
-        st.metric("Context SOS", f"{round(sos_mult, 2)}x")
+        st.metric("Model Win Prob", f"{over_prob}%")
+        
+        implied_prob = american_to_implied(market_odds) * 100
+        edge = over_prob - implied_prob
+        st.divider()
+        st.subheader("💰 Market Edge")
+        st.metric("Market Implied", f"{round(implied_prob, 1)}%", delta=f"{round(edge, 1)}% Edge")
+        
+        # Kelly Recommendation Calculation
+        dec_odds = american_to_decimal(market_odds)
+        b = dec_odds - 1
+        p = over_prob / 100
+        q = 1 - p
+        kelly_f = (b * p - q) / b if b > 0 else 0
+        suggested_stake = max(0, kelly_f * bankroll * kelly_mult)
+        
+        st.divider()
+        st.subheader("🎯 Kelly Recommendation")
+        if edge > 0 and suggested_stake > 0:
+            st.header(f"${round(suggested_stake, 2)}")
+            st.caption(f"Bet {round(kelly_f * kelly_mult * 100, 2)}% of bankroll.")
+            st.success("🔥 VALUE DETECTED")
+        else:
+            st.header("$0.00")
+            st.error("❌ NO EDGE")
 
 elif mode == "Team Scout Radar":
     st.subheader(f"📡 {selected_team_abbr} Roster Radar")
@@ -143,19 +219,17 @@ elif mode == "Team Scout Radar":
                             "Player": row['PLAYER'],
                             "Avg": round(t_mean, 1),
                             "Proj": round(t_proj, 1),
-                            "Context Bump": round(t_proj - t_mean, 1)
+                            "Bump": round(t_proj - t_mean, 1)
                         })
-                    time.sleep(0.1) # Rate limit safety
+                    time.sleep(0.1)
                 status.update(label="Scan Complete!", state="complete")
 
-            res_df = pd.DataFrame(results).sort_values(by="Context Bump", ascending=False)
-            
-            # --- FIX: SAFE STYLING BLOCK ---
+            res_df = pd.DataFrame(results).sort_values(by="Bump", ascending=False)
             try:
-                st.dataframe(
-                    res_df.style.background_gradient(subset=['Context Bump'], cmap='RdYlGn'), 
-                    use_container_width=True
-                )
+                st.dataframe(res_df.style.background_gradient(subset=['Bump'], cmap='RdYlGn'), use_container_width=True)
             except ImportError:
-                st.warning("⚠️ Heatmap disabled. Add `matplotlib` to requirements.txt for full visuals.")
                 st.dataframe(res_df, use_container_width=True)
+            
+            radar_fig = go.Figure(go.Bar(x=res_df['Player'], y=res_df['Bump'], marker_color='#00ff96'))
+            radar_fig.update_layout(template="plotly_dark", title=f"Contextual Impact on {stat_category.upper()}")
+            st.plotly_chart(radar_fig, use_container_width=True)
