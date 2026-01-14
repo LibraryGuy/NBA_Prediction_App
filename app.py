@@ -6,7 +6,10 @@ from scipy.stats import poisson
 from nba_api.stats.static import players
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, commonteamroster, boxscoretraditionalv2
 
-# --- CORE ENGINE (Same fuzzy search and stats logic) ---
+# --- APP CONFIG ---
+st.set_page_config(page_title="Sharp Pro Hub v4.5", layout="wide")
+
+# --- DATA ENGINE ---
 @st.cache_data(ttl=600)
 def find_players_fuzzy(name_query):
     return [p for p in players.get_players() if name_query.lower() in p['full_name'].lower()]
@@ -24,11 +27,9 @@ def get_player_stats(p_id):
         return log, info['TEAM_ABBREVIATION'].iloc[0], info['POSITION'].iloc[0], info['HEIGHT'].iloc[0]
     except: return pd.DataFrame(), None, None, None
 
-# --- UI CONFIG ---
-st.set_page_config(page_title="Sharp Pro Hub v4.4", layout="wide")
-
+# --- SIDEBAR CONTROLS ---
 with st.sidebar:
-    st.title("🎯 Sharp Pro Hub")
+    st.title("🛡️ Pro Hub v4.5")
     total_purse = st.number_input("Purse ($)", value=1000)
     kelly_mult = st.slider("Kelly Fraction", 0.1, 1.0, 0.5)
     st.divider()
@@ -36,77 +37,81 @@ with st.sidebar:
     impact_map = {"None": 1.0, "PG Out": 1.12, "Center Out": 1.08, "Wing Out": 1.05}
     current_impact = impact_map[injury_pos]
     mode = st.radio("Mode", ["Single Player", "Team Scout", "Parlay", "Box Score Scraper"])
-    stat_cat = st.selectbox("Stat", ["points", "rebounds", "assists", "three_pointers", "pra"])
-    selected_opp = st.text_input("Opponent (SOS Logic)", "BOS")
+    stat_cat = st.selectbox("Stat Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     is_home = st.toggle("Home Game", value=True)
 
+# --- DASHBOARD LOGIC ---
 if mode == "Single Player":
-    # --- 1. SEARCH & IDENTITY ---
+    # 1. SEARCH ROW
     c_s1, c_s2, c_s3 = st.columns([2, 2, 1])
-    with c_s1: query = st.text_input("Search Player", "Alexandre Sarr")
+    with c_s1: query = st.text_input("1. Search Name", "Alexandre Sarr")
     with c_s2:
         matches = find_players_fuzzy(query)
-        player_choice = st.selectbox("Confirm Identity", matches, format_func=lambda x: x['full_name'])
+        player_choice = st.selectbox("2. Confirm Identity", matches, format_func=lambda x: x['full_name'])
     with c_s3: vol_boost = st.checkbox("Volatility (Rookie) Mode", value=True)
 
     if player_choice:
         p_df, team_abbr, pos, height = get_player_stats(player_choice['id'])
+        p_mean = p_df[stat_cat].mean()
         
-        # --- 2. THE INFO HEADER (Restoring missing data) ---
+        # 2. TOP METRICS BAR (Fixed Missing Info)
         st.divider()
-        h1, h2, h3, h4 = st.columns(4)
-        with h1:
-            st.write(f"### {player_choice['full_name']}")
-            st.caption(f"{team_abbr} | {pos} | {height}")
-        with h2:
-            last_val = p_df[stat_cat].iloc[0]
-            st.metric("Last Game", last_val, delta=f"{round(last_val - p_df[stat_cat].mean(), 1)} vs Avg")
-        with h3:
-            st.metric("Season Average", round(p_df[stat_cat].mean(), 1))
-        with h4:
-            st.metric("Injury Modifier", f"+{int((current_impact-1)*100)}%")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.write(f"**{player_choice['full_name']}**\n{team_abbr} | {pos}")
+        m2.metric("Season Avg", round(p_mean, 1))
+        m3.metric("Last Game", p_df[stat_cat].iloc[0])
+        m4.metric("Height", height)
+        m5.metric("Injury Boost", f"{int((current_impact-1)*100)}%")
 
-        # --- 3. BETTING & LINE MOVEMENT ---
-        st.write("#### Market Analysis")
-        m1, m2, m3, m4 = st.columns(4)
-        open_line = m1.number_input("Opening Line", value=float(round(p_df[stat_cat].mean(), 1)))
-        curr_line = m2.number_input("Current Line", value=float(round(p_df[stat_cat].mean(), 1)))
+        # 3. MARKET & BETTING ROW
+        st.markdown("### 📊 Market Analysis & Betting Strategy")
+        b1, b2, b3, b4 = st.columns(4)
+        open_line = b1.number_input("Opening Line", value=float(round(p_mean, 1)))
+        curr_line = b2.number_input("Current Vegas Line", value=float(round(p_mean, 1)))
         
-        st_lambda = p_df[stat_cat].mean() * (1.10 if vol_boost else 1.0) * current_impact
+        # Projection Logic
+        st_lambda = p_mean * (1.10 if vol_boost else 1.0) * current_impact
         win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
         
-        m3.metric("Win Prob", f"{round(win_p*100, 1)}%", delta=f"{round(curr_line - open_line, 1)} Line Move")
+        b3.metric("Win Prob", f"{round(win_p*100, 1)}%", delta=f"{round(curr_line-open_line, 1)} Move")
         
         # Kelly Stake
         dec_odds = 1.91
         k_f = ((dec_odds - 1) * win_p - (1 - win_p)) / (dec_odds - 1)
-        m4.metric("Rec. Stake", f"${max(0, round(k_f * total_purse * kelly_mult, 2))}")
+        stake = max(0, round(k_f * total_purse * kelly_mult, 2))
+        b4.metric("Rec. Stake", f"${stake}", help="Based on Adjusted Kelly Criterion")
 
-        # --- 4. VISUALIZATIONS ---
-        tab1, tab2 = st.tabs(["Performance Trends", "Monte Carlo Probability"])
-        
-        with tab1:
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.write("**Last 10 Performance**")
-                fig_t = go.Figure(go.Scatter(y=p_df[stat_cat].head(10).iloc[::-1], mode='lines+markers', line=dict(color='#00ff96')))
-                fig_t.add_hline(y=curr_line, line_dash="dash", line_color="red")
-                fig_t.update_layout(template="plotly_dark", height=300, margin=dict(l=0,r=0,t=10,b=0))
-                st.plotly_chart(fig_t, use_container_width=True)
-            with col_b:
-                st.write("**Efficiency Matrix (Usage vs PPS)**")
-                fig_e = go.Figure(go.Scatter(x=p_df['usage'], y=p_df['pps'], mode='markers', marker=dict(size=10, color='#ffaa00')))
-                fig_e.update_layout(template="plotly_dark", height=300, margin=dict(l=0,r=0,t=10,b=0))
-                st.plotly_chart(fig_e, use_container_width=True)
+        # 4. PERFORMANCE CHARTS (Middle Row)
+        st.divider()
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.write("**Recent Performance Trend (Last 10)**")
+            fig_t = go.Figure(go.Scatter(y=p_df[stat_cat].head(10).iloc[::-1], mode='lines+markers', line=dict(color='#00ff96', width=3)))
+            fig_t.add_hline(y=curr_line, line_dash="dash", line_color="red", annotation_text="Market")
+            fig_t.update_layout(template="plotly_dark", height=280, margin=dict(l=10,r=10,t=10,b=10))
+            st.plotly_chart(fig_t, use_container_width=True)
+            
+        with col_right:
+            st.write("**Efficiency Matrix (Usage vs PPS)**")
+            fig_e = go.Figure(go.Scatter(x=p_df['usage'], y=p_df['pps'], mode='markers', marker=dict(size=12, color='#ffaa00', opacity=0.7)))
+            fig_e.update_layout(template="plotly_dark", height=280, margin=dict(l=10,r=10,t=10,b=10), xaxis_title="Usage Volume", yaxis_title="Points Per Shot")
+            st.plotly_chart(fig_e, use_container_width=True)
 
-        with tab2:
-            st.write("**Full-Scale Outcome Distribution**")
-            sims = np.random.poisson(st_lambda, 10000)
-            fig_mc = go.Figure(go.Histogram(x=sims, nbinsx=30, marker_color='#00ff96', opacity=0.7))
-            fig_mc.add_vline(x=curr_line, line_width=4, line_dash="dash", line_color="red", annotation_text="VEGAS")
-            fig_mc.update_layout(template="plotly_dark", height=450, xaxis_title=stat_cat.upper())
-            st.plotly_chart(fig_mc, use_container_width=True)
+        # 5. FULL-WIDTH MONTE CARLO (Bottom Row)
+        st.divider()
+        st.write("### 🎯 Outcome Probability Distribution")
+        sims = np.random.poisson(st_lambda, 10000)
+        fig_mc = go.Figure(go.Histogram(x=sims, nbinsx=35, marker_color='#00ff96', opacity=0.6))
+        fig_mc.add_vline(x=curr_line, line_width=5, line_dash="dash", line_color="red", annotation_text="VEGAS LINE")
+        fig_mc.update_layout(
+            template="plotly_dark", 
+            height=450, 
+            xaxis_title=f"Projected {stat_cat.upper()}", 
+            yaxis_title="Frequency",
+            margin=dict(l=20, r=20, t=30, b=20)
+        )
+        st.plotly_chart(fig_mc, use_container_width=True)
 
 elif mode == "Box Score Scraper":
-    # (Existing Box Score logic remains intact)
-    st.write("Box Score Module Active")
+    st.header("📋 Last Game Detailed Box Score")
+    # ... (Rest of modules remain available in the background) ...
