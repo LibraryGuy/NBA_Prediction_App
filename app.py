@@ -53,17 +53,17 @@ def calculate_sharp_lambda(p_mean, pace, sos, star, home, b2b):
     return p_mean * pace * sos * (1.15 if star else 1.0) * (1.03 if home else 0.97) * (0.95 if b2b else 1.0)
 
 # --- 2. UI LAYOUT & SIDEBAR ---
-st.set_page_config(page_title="Sharp Pro v3.3", layout="wide", page_icon="💰")
+st.set_page_config(page_title="Sharp Pro v3.4", layout="wide", page_icon="🏦")
 sos_data, team_map = load_nba_universe()
 
 with st.sidebar:
-    st.header("🏦 Bankroll Management")
+    st.header("💰 Bankroll & Staking")
     total_purse = st.number_input("Starting Purse ($)", value=1000, step=50)
     kelly_multiplier = st.slider("Kelly Fraction", 0.1, 1.0, 0.5)
     st.divider()
     
-    st.header("🎯 Mode Select")
-    mode = st.radio("Switch View", ["Single Player", "Team Scout Radar"])
+    st.header("🎯 System Mode")
+    mode = st.radio("View", ["Single Player", "Team Scout Radar", "Parlay Builder"])
     st.divider()
     stat_cat = st.selectbox("Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     selected_opp = st.selectbox("Opponent", sorted(list(team_map.keys())), index=0)
@@ -74,7 +74,7 @@ with st.sidebar:
 
 # --- 3. SINGLE PLAYER DASHBOARD ---
 if mode == "Single Player":
-    search_q = st.text_input("Enter Player Name", "Jalen Brunson")
+    search_q = st.text_input("Player Search", "Jalen Brunson")
     p_df, p_id, team_abbr = get_player_data(search_q)
     
     if not p_df.empty:
@@ -86,51 +86,37 @@ if mode == "Single Player":
         market_odds = col_bet2.number_input("Odds (American)", value=-110)
 
         main_col, side_col = st.columns([2, 1])
-        
         with main_col:
             st.subheader("📈 Last 10 Games Trend")
             last_10 = p_df.head(10).iloc[::-1]
             trend_fig = go.Figure(go.Scatter(x=list(range(1, 11)), y=last_10[stat_cat], mode='lines+markers', line=dict(color='#00ff96', width=4)))
-            trend_fig.add_hline(y=user_line, line_dash="dash", line_color="red", annotation_text="Vegas Line")
+            trend_fig.add_hline(y=user_line, line_dash="dash", line_color="red")
             trend_fig.update_layout(template="plotly_dark", height=300)
             st.plotly_chart(trend_fig, use_container_width=True)
 
-            st.subheader("📊 Efficiency vs. Volume (Last 15 Games)")
-            eff_fig = go.Figure(go.Scatter(x=p_df['usage'].head(15), y=p_df['pps'].head(15), mode='markers+text', text=p_df['points'], marker=dict(size=14, color=p_df['points'], colorscale='Plasma', showscale=True)))
-            eff_fig.update_layout(template="plotly_dark", xaxis_title="Usage Volume", yaxis_title="PPS", height=350)
+            st.subheader("📊 Efficiency Matrix")
+            eff_fig = go.Figure(go.Scatter(x=p_df['usage'].head(15), y=p_df['pps'].head(15), mode='markers', marker=dict(size=12, color=p_df['points'], colorscale='Viridis')))
+            eff_fig.update_layout(template="plotly_dark", xaxis_title="Usage", yaxis_title="PPS", height=350)
             st.plotly_chart(eff_fig, use_container_width=True)
 
         with side_col:
-            st.subheader("💰 Staking Strategy")
+            st.subheader("🎲 Probability")
             st.metric("Sharp Projection", round(sharp_lambda, 1))
-            
             over_prob = round((1 - poisson.cdf(user_line - 0.5, sharp_lambda)) * 100, 1)
             st.metric("Win Probability", f"{over_prob}%")
             
-            # Advanced Kelly Calculation
+            # Kelly Logic
             dec_odds = (market_odds / 100) + 1 if market_odds > 0 else (100 / abs(market_odds)) + 1
             win_p = over_prob / 100
-            # f = (bp - q) / b
-            b = dec_odds - 1
-            kelly_f = (b * win_p - (1 - win_p)) / b if b > 0 else 0
-            
-            final_stake = max(0, kelly_f * total_purse * kelly_multiplier)
-            
-            st.metric("Suggested Stake", f"${round(final_stake, 2)}")
-            st.info(f"Based on {kelly_multiplier}x Kelly using a ${total_purse} purse.")
-            
-            # Mini Distribution Chart
-            sims = np.random.poisson(sharp_lambda, 10000)
-            dist_fig = go.Figure(go.Histogram(x=sims, nbinsx=20, marker_color='#00ff96', opacity=0.6))
-            dist_fig.update_layout(template="plotly_dark", height=200, margin=dict(l=0,r=0,t=0,b=0))
-            st.plotly_chart(dist_fig, use_container_width=True)
+            k_f = ( (dec_odds-1)*win_p - (1-win_p) ) / (dec_odds-1) if dec_odds > 1 else 0
+            st.metric("Suggested Stake", f"${max(0, round(k_f * total_purse * kelly_multiplier, 2))}")
 
 # --- 4. TEAM SCOUT RADAR ---
 elif mode == "Team Scout Radar":
     team_to_scout = st.selectbox("Select Team", sorted(list(team_map.keys())), index=0)
     if st.button(f"🚀 Scan {team_to_scout} Roster"):
         t_id = team_map[team_to_scout]
-        with st.status("Performing Sharp Scan...") as s:
+        with st.status("Analyzing Matchup...") as s:
             roster = commonteamroster.CommonTeamRoster(team_id=t_id).get_data_frames()[0].head(10)
             results = []
             for _, row in roster.iterrows():
@@ -138,16 +124,53 @@ elif mode == "Team Scout Radar":
                 if not p_log.empty:
                     m = p_log[stat_cat].mean()
                     p = calculate_sharp_lambda(m, pace_mult, sos_data.get(selected_opp, 1.0), star_out, is_home, is_b2b)
-                    results.append({"Player": row['PLAYER'], "Avg": round(m, 1), "Proj": round(p, 1), "Edge": round(p - m, 1)})
-                time.sleep(0.05)
+                    prob = round((1 - poisson.cdf(m - 0.5, p)) * 100, 1)
+                    results.append({"Player": row['PLAYER'], "Avg": round(m,1), "Proj": round(p,1), "Edge": round(p-m,1), "Hit%": prob})
             s.update(label="Scan Complete", state="complete")
         
-        df = pd.DataFrame(results).sort_values("Edge", ascending=False)
-        st.table(df)
+        st.session_state['radar_results'] = pd.DataFrame(results).sort_values("Edge", ascending=False)
+        st.table(st.session_state['radar_results'])
+
+# --- 5. PARLAY BUILDER (NEW FEATURE) ---
+elif mode == "Parlay Builder":
+    st.subheader("🔗 Multi-Leg Parlay Optimizer")
+    if 'radar_results' not in st.session_state:
+        st.warning("Please run a 'Team Scout Radar' scan first to populate available legs.")
+    else:
+        available_players = st.session_state['radar_results']['Player'].tolist()
+        selections = st.multiselect("Select Legs for Parlay", available_players)
         
-        if not df.empty:
-            st.subheader(f"📊 Market Anomaly Probability: {df.iloc[0]['Player']}")
-            sims = np.random.poisson(df.iloc[0]['Proj'], 10000)
-            fig = go.Figure(go.Histogram(x=sims, marker_color='#00ff96', histnorm='probability'))
-            fig.update_layout(template="plotly_dark", title=f"Outlier Probability Distribution: {df.iloc[0]['Player']}")
-            st.plotly_chart(fig, use_container_width=True)
+        if selections:
+            parlay_prob = 1.0
+            total_decimal_odds = 1.0
+            
+            st.write("### Parlay Composition")
+            for player in selections:
+                row = st.session_state['radar_results'][st.session_state['radar_results']['Player'] == player].iloc[0]
+                p_win = row['Hit%'] / 100
+                parlay_prob *= p_win
+                
+                # Assume standard -110 juice for each leg unless specified
+                leg_odds = st.number_input(f"Odds for {player} Over {row['Avg']}", value=-110, key=f"odds_{player}")
+                dec_leg = (leg_odds / 100) + 1 if leg_odds > 0 else (100 / abs(leg_odds)) + 1
+                total_decimal_odds *= dec_leg
+                
+                st.write(f"✅ **{player}**: {row['Hit%']}% Win Prob | {leg_odds} Odds")
+            
+            st.divider()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Parlay Win Prob", f"{round(parlay_prob * 100, 2)}%")
+            
+            # Convert decimal back to American for display
+            parlay_american = round((total_decimal_odds - 1) * 100) if total_decimal_odds >= 2 else round(-100 / (total_decimal_odds - 1))
+            c2.metric("Combined Odds", f"{parlay_american}")
+            
+            # Parlay Kelly
+            p_k_f = ( (total_decimal_odds-1)*parlay_prob - (1-parlay_prob) ) / (total_decimal_odds-1)
+            parlay_stake = max(0, p_k_f * total_purse * kelly_multiplier)
+            c3.metric("Suggested Stake", f"${round(parlay_stake, 2)}")
+            
+            if parlay_prob * total_decimal_odds > 1.0:
+                st.success("🔥 This parlay has positive Expected Value (+EV)!")
+            else:
+                st.error("⚠️ Negative Expected Value. The juice outweighs the probability.")
