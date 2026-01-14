@@ -7,7 +7,7 @@ from scipy.stats import poisson
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, commonteamroster
 
-# --- 1. CORE ENGINE & DATA ---
+# --- 1. CORE DATA ENGINE ---
 @st.cache_data(ttl=3600)
 def load_nba_universe():
     all_30 = {
@@ -52,15 +52,21 @@ def get_player_data(player_input, is_id=False):
 def calculate_sharp_lambda(p_mean, pace, sos, star, home, b2b):
     return p_mean * pace * sos * (1.15 if star else 1.0) * (1.03 if home else 0.97) * (0.95 if b2b else 1.0)
 
-# --- 2. INTERFACE ---
+# --- 2. UI LAYOUT & SIDEBAR ---
+st.set_page_config(page_title="Sharp Pro v3.3", layout="wide", page_icon="💰")
 sos_data, team_map = load_nba_universe()
 
 with st.sidebar:
+    st.header("🏦 Bankroll Management")
+    total_purse = st.number_input("Starting Purse ($)", value=1000, step=50)
+    kelly_multiplier = st.slider("Kelly Fraction", 0.1, 1.0, 0.5)
+    st.divider()
+    
     st.header("🎯 Mode Select")
     mode = st.radio("Switch View", ["Single Player", "Team Scout Radar"])
     st.divider()
     stat_cat = st.selectbox("Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
-    selected_opp = st.selectbox("Opponent", sorted(list(team_map.keys())), index=sorted(list(team_map.keys())).index("SAC"))
+    selected_opp = st.selectbox("Opponent", sorted(list(team_map.keys())), index=0)
     is_home = st.toggle("Home Game", value=True)
     is_b2b = st.toggle("Back-to-Back")
     star_out = st.toggle("Star Teammate Out?")
@@ -75,7 +81,6 @@ if mode == "Single Player":
         p_mean = p_df[stat_cat].mean()
         sharp_lambda = calculate_sharp_lambda(p_mean, pace_mult, sos_data.get(selected_opp, 1.0), star_out, is_home, is_b2b)
         
-        # User Betting Input
         col_bet1, col_bet2 = st.columns(2)
         user_line = col_bet1.number_input("Vegas Line", value=float(round(p_mean, 1)), step=0.5)
         market_odds = col_bet2.number_input("Odds (American)", value=-110)
@@ -83,7 +88,6 @@ if mode == "Single Player":
         main_col, side_col = st.columns([2, 1])
         
         with main_col:
-            # TREND GRAPH
             st.subheader("📈 Last 10 Games Trend")
             last_10 = p_df.head(10).iloc[::-1]
             trend_fig = go.Figure(go.Scatter(x=list(range(1, 11)), y=last_10[stat_cat], mode='lines+markers', line=dict(color='#00ff96', width=4)))
@@ -91,28 +95,31 @@ if mode == "Single Player":
             trend_fig.update_layout(template="plotly_dark", height=300)
             st.plotly_chart(trend_fig, use_container_width=True)
 
-            # EFFICIENCY MATRIX
             st.subheader("📊 Efficiency vs. Volume (Last 15 Games)")
             eff_fig = go.Figure(go.Scatter(x=p_df['usage'].head(15), y=p_df['pps'].head(15), mode='markers+text', text=p_df['points'], marker=dict(size=14, color=p_df['points'], colorscale='Plasma', showscale=True)))
-            eff_fig.update_layout(template="plotly_dark", xaxis_title="Usage Volume", yaxis_title="Points Per Shot (PPS)", height=350)
+            eff_fig.update_layout(template="plotly_dark", xaxis_title="Usage Volume", yaxis_title="PPS", height=350)
             st.plotly_chart(eff_fig, use_container_width=True)
 
         with side_col:
-            st.subheader("🎲 Model Output")
+            st.subheader("💰 Staking Strategy")
             st.metric("Sharp Projection", round(sharp_lambda, 1))
             
-            # Poisson Prob
             over_prob = round((1 - poisson.cdf(user_line - 0.5, sharp_lambda)) * 100, 1)
             st.metric("Win Probability", f"{over_prob}%")
             
-            # Kelly Criterion
-            bankroll = 1000
+            # Advanced Kelly Calculation
             dec_odds = (market_odds / 100) + 1 if market_odds > 0 else (100 / abs(market_odds)) + 1
             win_p = over_prob / 100
-            kelly_f = ((dec_odds - 1) * win_p - (1 - win_p)) / (dec_odds - 1) if dec_odds > 1 else 0
-            st.metric("Kelly Suggestion", f"${max(0, round(kelly_f * bankroll, 2))}")
+            # f = (bp - q) / b
+            b = dec_odds - 1
+            kelly_f = (b * win_p - (1 - win_p)) / b if b > 0 else 0
             
-            # Distribution Small
+            final_stake = max(0, kelly_f * total_purse * kelly_multiplier)
+            
+            st.metric("Suggested Stake", f"${round(final_stake, 2)}")
+            st.info(f"Based on {kelly_multiplier}x Kelly using a ${total_purse} purse.")
+            
+            # Mini Distribution Chart
             sims = np.random.poisson(sharp_lambda, 10000)
             dist_fig = go.Figure(go.Histogram(x=sims, nbinsx=20, marker_color='#00ff96', opacity=0.6))
             dist_fig.update_layout(template="plotly_dark", height=200, margin=dict(l=0,r=0,t=0,b=0))
@@ -120,10 +127,10 @@ if mode == "Single Player":
 
 # --- 4. TEAM SCOUT RADAR ---
 elif mode == "Team Scout Radar":
-    team_to_scout = st.selectbox("Select Team", sorted(list(team_map.keys())), index=sorted(list(team_map.keys())).index("NYK"))
+    team_to_scout = st.selectbox("Select Team", sorted(list(team_map.keys())), index=0)
     if st.button(f"🚀 Scan {team_to_scout} Roster"):
         t_id = team_map[team_to_scout]
-        with st.status("Scanning 2026 Roster...") as s:
+        with st.status("Performing Sharp Scan...") as s:
             roster = commonteamroster.CommonTeamRoster(team_id=t_id).get_data_frames()[0].head(10)
             results = []
             for _, row in roster.iterrows():
@@ -132,14 +139,14 @@ elif mode == "Team Scout Radar":
                     m = p_log[stat_cat].mean()
                     p = calculate_sharp_lambda(m, pace_mult, sos_data.get(selected_opp, 1.0), star_out, is_home, is_b2b)
                     results.append({"Player": row['PLAYER'], "Avg": round(m, 1), "Proj": round(p, 1), "Edge": round(p - m, 1)})
-                time.sleep(0.1)
+                time.sleep(0.05)
             s.update(label="Scan Complete", state="complete")
         
         df = pd.DataFrame(results).sort_values("Edge", ascending=False)
         st.table(df)
         
         if not df.empty:
-            st.subheader(f"🔥 Best Value: {df.iloc[0]['Player']}")
+            st.subheader(f"📊 Market Anomaly Probability: {df.iloc[0]['Player']}")
             sims = np.random.poisson(df.iloc[0]['Proj'], 10000)
             fig = go.Figure(go.Histogram(x=sims, marker_color='#00ff96', histnorm='probability'))
             fig.update_layout(template="plotly_dark", title=f"Outlier Probability Distribution: {df.iloc[0]['Player']}")
