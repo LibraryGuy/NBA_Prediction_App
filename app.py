@@ -33,7 +33,7 @@ def get_player_data(player_input, is_id=False):
     if not is_id:
         nba_players = players.get_players()
         match = [p for p in nba_players if player_input.lower() in p['full_name'].lower()]
-        if not match: return pd.DataFrame(), None, None
+        if not match: return pd.DataFrame(), None, None, None
         p_id = match[0]['id']
     else:
         p_id = player_input
@@ -51,11 +51,10 @@ def get_player_data(player_input, is_id=False):
     except: return pd.DataFrame(), None, None, None
 
 def calculate_sharp_lambda(p_mean, pace, sos, star, home, b2b, injury_impact):
-    # Base Model * External Factors * Injury Modifier
     return p_mean * pace * sos * (1.15 if star else 1.0) * (1.03 if home else 0.97) * (0.95 if b2b else 1.0) * injury_impact
 
 # --- 2. UI LAYOUT & SIDEBAR ---
-st.set_page_config(page_title="Sharp Pro Hub v4.0", layout="wide", page_icon="📈")
+st.set_page_config(page_title="Sharp Pro Hub v4.1", layout="wide", page_icon="📈")
 sos_data, team_map = load_nba_universe()
 
 with st.sidebar:
@@ -68,8 +67,7 @@ with st.sidebar:
     injury_pos = st.selectbox("Key Player Out (Position)", ["None", "Point Guard", "Center", "Wing/Forward"])
     impact_map = {"None": 1.0, "Point Guard": 1.12, "Center": 1.08, "Wing/Forward": 1.05}
     current_impact = impact_map[injury_pos]
-    st.caption(f"Positional Boost: {round((current_impact-1)*100)}% for related stats.")
-
+    
     st.header("🎯 System Mode")
     mode = st.radio("Switch View", ["Single Player", "Team Scout Radar", "Parlay Builder", "Box Score Scraper"])
     st.divider()
@@ -78,7 +76,7 @@ with st.sidebar:
     is_home = st.toggle("Home Game", value=True)
     pace_mult = st.select_slider("Pace", options=[0.92, 1.0, 1.08], value=1.0)
 
-# --- 3. SINGLE PLAYER DASHBOARD + LINE TRACKER ---
+# --- 3. SINGLE PLAYER DASHBOARD (VISUALS RESTORED) ---
 if mode == "Single Player":
     search_q = st.text_input("Player Search", "Jalen Brunson")
     p_df, p_id, team_abbr, p_pos = get_player_data(search_q)
@@ -87,70 +85,80 @@ if mode == "Single Player":
         p_mean = p_df[stat_cat].mean()
         sharp_lambda = calculate_sharp_lambda(p_mean, pace_mult, sos_data.get(selected_opp, 1.0), False, is_home, False, current_impact)
         
-        # Line Movement Tracker Simulation (Opening vs Current)
-        c1, c2 = st.columns(2)
-        opening_line = c1.number_input("Opening Line", value=float(round(p_mean, 1)))
-        current_line = c2.number_input("Current Vegas Line", value=float(round(p_mean, 1)))
-        
-        movement = current_line - opening_line
-        if movement > 0: st.warning(f"⚠️ Line moved UP {movement} pts (Sharp Action Detected)")
-        elif movement < 0: st.info(f"📉 Line moved DOWN {abs(movement)} pts")
+        # Line Movement Inputs
+        c_line1, c_line2 = st.columns(2)
+        opening_line = c_line1.number_input("Opening Line", value=float(round(p_mean, 1)))
+        current_line = c_line2.number_input("Current Line", value=float(round(p_mean, 1)))
 
         main_col, side_col = st.columns([2, 1])
+        
         with main_col:
-            st.subheader("📈 Last 10 Trend & Market Line")
-            trend_fig = go.Figure(go.Scatter(x=list(range(1, 11)), y=p_df[stat_cat].head(10).iloc[::-1], mode='lines+markers', line=dict(color='#00ff96')))
-            trend_fig.add_hline(y=current_line, line_dash="dash", line_color="red", annotation_text="Current Market")
-            trend_fig.update_layout(template="plotly_dark", height=300)
+            # CHART 1: Last 10 Trend
+            st.subheader(f"📈 {stat_cat.title()} Trend (Last 10)")
+            trend_fig = go.Figure(go.Scatter(x=list(range(1, 11)), y=p_df[stat_cat].head(10).iloc[::-1], mode='lines+markers', line=dict(color='#00ff96', width=3)))
+            trend_fig.add_hline(y=current_line, line_dash="dash", line_color="red", annotation_text="Market Line")
+            trend_fig.update_layout(template="plotly_dark", height=250, margin=dict(l=20,r=20,t=30,b=20))
             st.plotly_chart(trend_fig, use_container_width=True)
 
+            # CHART 2: Efficiency Scatter Plot (RE-ADDED)
+            st.subheader("📊 Efficiency Matrix (Usage vs PPS)")
+            eff_fig = go.Figure(go.Scatter(
+                x=p_df['usage'].head(15), y=p_df['pps'].head(15), 
+                mode='markers+text', text=p_df['points'],
+                marker=dict(size=14, color=p_df['points'], colorscale='Plasma', showscale=True)
+            ))
+            eff_fig.update_layout(template="plotly_dark", xaxis_title="Usage Volume", yaxis_title="Points Per Shot", height=300)
+            st.plotly_chart(eff_fig, use_container_width=True)
+
         with side_col:
-            st.subheader("🎲 Betting Logic")
+            # CHART 3: Monte Carlo Poisson (RE-ADDED)
+            st.subheader("🎲 Outcome Probability")
             win_p = (1 - poisson.cdf(current_line - 0.5, sharp_lambda))
             st.metric("Win Probability", f"{round(win_p * 100, 1)}%")
-            # Kelly with Purse
-            odds = -110
-            dec_odds = 1.91
+            
+            sims = np.random.poisson(sharp_lambda, 10000)
+            dist_fig = go.Figure(go.Histogram(x=sims, nbinsx=15, marker_color='#00ff96', opacity=0.6))
+            dist_fig.add_vline(x=current_line, line_color="red", line_width=3)
+            dist_fig.update_layout(template="plotly_dark", height=200, margin=dict(l=0,r=0,t=0,b=0), showlegend=False)
+            st.plotly_chart(dist_fig, use_container_width=True)
+            
+            # Betting Suggestion
+            dec_odds = 1.91 # Standard -110
             k_f = ((dec_odds - 1) * win_p - (1 - win_p)) / (dec_odds - 1)
-            st.metric("Suggested Stake", f"${max(0, round(k_f * total_purse * kelly_multiplier, 2))}")
+            stake = max(0, round(k_f * total_purse * kelly_multiplier, 2))
+            st.success(f"**Recommended Stake:** ${stake}")
+            st.info(f"Reflects {injury_pos} injury boost.")
 
 # --- 4. BOX SCORE SCRAPER ---
 elif mode == "Box Score Scraper":
     st.subheader("📋 Last Game Deep-Dive")
     search_q = st.text_input("Enter Player Name", "Jalen Brunson")
     p_df, p_id, team_abbr, p_pos = get_player_data(search_q)
-    
     if p_id:
         last_game_id = p_df.iloc[0]['Game_ID']
-        try:
-            box = boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=last_game_id).get_data_frames()[0]
-            player_stats = box[box['PLAYER_ID'] == p_id]
-            st.write(f"### Last Game Stats vs {p_df.iloc[0]['MATCHUP']}")
-            st.table(player_stats[['MIN', 'PTS', 'REB', 'AST', 'STL', 'BLK', 'FG_PCT']])
-        except:
-            st.error("Could not fetch detailed box score for this game.")
+        box = boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=last_game_id).get_data_frames()[0]
+        player_stats = box[box['PLAYER_ID'] == p_id]
+        st.table(player_stats[['MIN', 'PTS', 'REB', 'AST', 'FGM', 'FGA', 'FG_PCT']])
 
 # --- 5. PARLAY BUILDER ---
 elif mode == "Parlay Builder":
     st.subheader("🔗 Multi-Leg Optimizer")
     if 'radar_results' not in st.session_state:
-        st.warning("Run a 'Team Scout Radar' scan first.")
+        st.warning("Please run a 'Team Scout Radar' scan first.")
     else:
         selections = st.multiselect("Select Legs", st.session_state['radar_results']['Player'].tolist())
         if selections:
-            parlay_p = 1.0
+            total_p = 1.0
             for player in selections:
-                row = st.session_state['radar_results'][st.session_state['radar_results']['Player'] == player].iloc[0]
-                parlay_p *= (row['Hit%'] / 100)
-            st.metric("Parlay Win Prob", f"{round(parlay_p * 100, 2)}%")
-            st.metric("Recommended Parlay Stake", f"${round(parlay_p * 0.05 * total_purse, 2)}") # Simple fractional parlay Kelly
+                total_p *= (st.session_state['radar_results'].loc[st.session_state['radar_results']['Player'] == player, 'Hit%'].iloc[0] / 100)
+            st.metric("Combined Win Prob", f"{round(total_p * 100, 1)}%")
 
 # --- 6. TEAM SCOUT RADAR ---
 elif mode == "Team Scout Radar":
     team_to_scout = st.selectbox("Select Team", sorted(list(team_map.keys())))
     if st.button(f"🚀 Scan {team_to_scout} Roster"):
         results = []
-        roster = commonteamroster.CommonTeamRoster(team_id=team_map[team_to_scout]).get_data_frames()[0].head(8)
+        roster = commonteamroster.CommonTeamRoster(team_id=team_map[team_to_scout]).get_data_frames()[0].head(10)
         for _, row in roster.iterrows():
             p_log, _, _, _ = get_player_data(row['PLAYER_ID'], is_id=True)
             if not p_log.empty:
