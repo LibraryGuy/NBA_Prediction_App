@@ -19,6 +19,7 @@ def get_league_context():
         avg_def = stats['DEF_RATING'].mean()
         avg_pace = stats['PACE'].mean()
         
+        # Create a combined lookup for SOS and Pace
         context_map = {}
         for _, row in stats.iterrows():
             context_map[row['TEAM_ABBREVIATION']] = {
@@ -45,7 +46,7 @@ def get_player_stats(p_id):
 
 def get_live_matchup(team_abbr, team_map):
     try:
-        # Static date for simulation; update to datetime.now() for production
+        # Note: update to datetime.now() for production
         board = scoreboardv2.ScoreboardV2(game_date='2026-01-14').get_data_frames()[0]
         t_id = team_map.get(team_abbr)
         game = board[(board['HOME_TEAM_ID'] == t_id) | (board['VISITOR_TEAM_ID'] == t_id)]
@@ -131,62 +132,72 @@ if mode == "Single Player":
             fig_mc.update_layout(template="plotly_dark", height=450)
             st.plotly_chart(fig_mc, use_container_width=True)
 
-# --- 4. MODE: TEAM SCOUT RADAR (RECOVERY FIXED) ---
+# --- 4. MODE: TEAM SCOUT RADAR (ALPHA ROTATION UPDATE) ---
 elif mode == "Team Scout Radar":
     st.header("🚀 Team Scout Radar")
     sel_team = st.selectbox("Select Team to Scan", sorted(list(team_map.keys())))
     
-    if st.button("Generate Roster Analysis"):
-        with st.spinner(f"Analyzing {sel_team} roster against live schedule..."):
+    if st.button("Generate Alpha Roster Analysis"):
+        with st.spinner(f"Identifying {sel_team} rotation alphas..."):
             try:
+                # 1. Fetch raw roster
                 roster_data = commonteamroster.CommonTeamRoster(team_id=team_map[sel_team]).get_data_frames()[0]
-                radar_data = []
                 
+                # 2. Matchup & Context
                 opp, home = get_live_matchup(sel_team, team_map)
-                
-                # Global Context for Team
                 p_team_pace = context_data.get(sel_team, {}).get('raw_pace', lg_avg_pace)
                 o_team_pace = context_data.get(opp, {}).get('raw_pace', lg_avg_pace) if opp else lg_avg_pace
                 matchup_pace = (p_team_pace + o_team_pace) / 2
                 pace_multiplier = matchup_pace / lg_avg_pace
                 sos_adj = context_data.get(opp, {}).get('sos', 1.0) if opp else 1.0
                 home_factor = 1.03 if home else 0.97
-
-                # Scan Roster
-                for _, row in roster_data.head(10).iterrows():
+                
+                # 3. Alpha Identification: Scan everyone to find the real rotation leaders
+                full_team_data = []
+                for _, row in roster_data.iterrows():
                     try:
                         p_log, _, _, _ = get_player_stats(row['PLAYER_ID'])
                         if not p_log.empty:
-                            m = p_log[stat_cat].mean()
-                            proj = m * injury_impact * sos_adj * pace_multiplier * home_factor
-                            # Edge calculation (Probability of hitting over the season average)
-                            prob = (1 - poisson.cdf(m - 0.5, proj)) * 100
-                            
-                            radar_data.append({
-                                "Player": row['PLAYER'], 
-                                "Avg": round(m, 1), 
-                                "Proj": round(proj, 1), 
-                                "Win%": f"{round(prob, 1)}%"
+                            avg_stat = p_log[stat_cat].mean()
+                            full_team_data.append({
+                                "Player": row['PLAYER'],
+                                "Avg": avg_stat,
+                                "p_id": row['PLAYER_ID']
                             })
                     except: continue
+                
+                # Sort by average descending (Alphas first) and take top 10
+                alpha_rotation = sorted(full_team_data, key=lambda x: x['Avg'], reverse=True)[:10]
+                
+                # 4. Final Projection Loop
+                radar_results = []
+                for player in alpha_rotation:
+                    m = player['Avg']
+                    proj = m * injury_impact * sos_adj * pace_multiplier * home_factor
+                    prob = (1 - poisson.cdf(m - 0.5, proj)) * 100
+                    radar_results.append({
+                        "Player": player['Player'], 
+                        "Avg": round(m, 1), 
+                        "Proj": round(proj, 1), 
+                        "Win%": f"{round(prob, 1)}%"
+                    })
 
-                if radar_data:
-                    df_radar = pd.DataFrame(radar_data)
+                if radar_results:
+                    df_radar = pd.DataFrame(radar_results)
+                    st.subheader(f"📋 Alpha Rotation: {sel_team} vs {opp if opp else 'N/A'}")
                     c1, c2 = st.columns([1, 1])
                     with c1:
-                        st.subheader("📋 Projections")
                         st.dataframe(df_radar, use_container_width=True, hide_index=True)
                     with c2:
-                        st.subheader(f"📊 Prob vs {opp if opp else 'League Avg'}")
                         df_radar['WinVal'] = df_radar['Win%'].str.replace('%','').astype(float)
                         fig_radar = go.Figure(go.Bar(x=df_radar['Player'], y=df_radar['WinVal'], marker_color='#00ff96'))
-                        fig_radar.update_layout(template="plotly_dark", height=400)
+                        fig_radar.update_layout(template="plotly_dark", height=400, title="Projected Edge (Pace/SOS Adjusted)")
                         st.plotly_chart(fig_radar, use_container_width=True)
                 else:
-                    st.warning("No data found for this team's current roster.")
+                    st.warning("Could not find enough active data for this roster.")
             except Exception as e:
-                st.error(f"Error loading radar: {e}")
+                st.error(f"Error executing Alpha Radar: {e}")
 
-# --- 5. MODE: BOX SCORE SCRAPER (STUB) ---
+# --- 5. MODE: BOX SCORE SCRAPER ---
 elif mode == "Box Score Scraper":
     st.info("Box Score Scraper logic can be implemented here.")
