@@ -13,15 +13,10 @@ from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonpl
 
 @st.cache_data(ttl=900)
 def get_automated_injury_list():
-    # Keep your existing logic; ensures Ty Jerome & Morant are flagged for Jan 15, 2026
     confirmed_out = ["Ty Jerome", "Ja Morant", "Zach Edey", "Scotty Pippen Jr.", "Brandon Clarke", "Jalen Suggs"]
     return confirmed_out
 
 def calculate_dynamic_usage(team_abbr, injury_list):
-    """
-    Returns a usage multiplier based on missing star power.
-    Logic: If a primary 'Engine' player is out, remaining players get a 5-12% boost.
-    """
     star_impact_map = {
         "MEM": ["Ja Morant", "Desmond Bane", "Jaren Jackson Jr."],
         "CLE": ["Donovan Mitchell", "Darius Garland"],
@@ -30,18 +25,44 @@ def calculate_dynamic_usage(team_abbr, injury_list):
         "MIL": ["Giannis Antetokounmpo", "Damian Lillard"],
         "ORL": ["Paolo Banchero", "Franz Wagner"]
     }
-    
     boost = 0.0
     team_stars = star_impact_map.get(team_abbr, [])
-    
     for star in team_stars:
         if star in injury_list:
-            # Aggregate boost: Primary stars missing creates more shots for others
-            boost += 0.08 # Constant 8% boost per missing top-tier star
-            
+            boost += 0.08 
     return round(boost, 2)
 
-# --- 2. CORE UTILITIES (NO LOGIC ALTERED) ---
+# --- 2. SAMPLE SIZE & ROBUST PROJECTION ENGINE ---
+
+def get_refined_projection(p_df, proj_minutes, stat_cat, weight, usage_boost, dvp, pace):
+    """
+    Calculates projection with a safety buffer for low-sample bench players.
+    Ensures players with small garbage-time samples don't break the scanner.
+    """
+    if p_df.empty: return 0.0, 0.0
+    
+    # Calculate raw rates
+    season_rate = p_df[f'{stat_cat}_per_min'].mean()
+    last5_rate = p_df.head(5)[f'{stat_cat}_per_min'].mean()
+    weighted_rate = (last5_rate * weight) + (season_rate * (1 - weight))
+    
+    # --- SAMPLE SIZE PROTECTION ---
+    total_minutes_played = p_df['minutes'].sum()
+    total_games = len(p_df)
+    
+    # Reliability Cap: If player has < 100 total mins, scale their rate down 
+    # to prevent outlier spikes from small samples (The N'Faly Dante Fix)
+    reliability_cap = 1.0
+    if total_minutes_played < 100:
+        reliability_cap = max(0.1, total_minutes_played / 100)
+    
+    # Apply context multipliers
+    st_lambda = weighted_rate * proj_minutes * dvp * pace * usage_boost * reliability_cap
+    season_avg = p_df[stat_cat].mean()
+    
+    return round(st_lambda, 2), round(season_avg, 2)
+
+# --- 3. CORE UTILITIES ---
 
 def get_live_matchup(team_abbr, team_map):
     try:
@@ -98,7 +119,7 @@ def calculate_dvp(pos, opp_abbr):
     pos_key = 'Guard' if 'Guard' in pos else ('Center' if 'Center' in pos else 'Forward')
     return dvp_map.get(pos_key, {}).get(opp_abbr, 1.0)
 
-# --- 3. VISUALIZATION ---
+# --- 4. VISUALIZATION ---
 def plot_scout_radar(team_abbr, opp_abbr, context_data):
     categories = ['Offense', 'Defense', 'Pace', 'Passing', 'Rebounding']
     def get_team_metrics(abbr):
@@ -121,8 +142,8 @@ def plot_poisson_chart(mu, line, cat):
     fig.update_layout(title=f"Outcome Distribution: {cat.upper()}", template="plotly_dark", height=250, margin=dict(l=10, r=10, t=40, b=10))
     return fig
 
-# --- 4. APP SETUP ---
-st.set_page_config(page_title="Sharp Pro v7.2", layout="wide")
+# --- 5. APP SETUP ---
+st.set_page_config(page_title="Sharp Pro v7.3", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 injury_list = get_automated_injury_list()
@@ -131,23 +152,20 @@ if 'trigger_scan' not in st.session_state:
     st.session_state.trigger_scan = False
 
 with st.sidebar:
-    st.title("🚀 Sharp Pro v7.2")
+    st.title("🚀 Sharp Pro v7.3")
     st.info(f"📋 **Injury Tracker Active:** {len(injury_list)} OUT.")
     app_mode = st.radio("Analysis Mode", ["Single Player", "Team Value Scanner"])
     st.divider()
     st.subheader("Model Weights")
     stat_cat = st.selectbox("Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     recency_weight = st.slider("Recency Bias", 0.0, 1.0, 0.3)
-    
-    # RETAINED: The Manual Slider
     manual_usage_boost = st.slider("Manual Usage Tweak", 1.0, 1.3, 1.0, 0.05)
-    
     st.divider()
     total_purse = st.number_input("Purse ($)", value=1000)
     kelly_mult = st.slider("Kelly Fraction", 0.1, 1.0, 0.25)
     proj_minutes = st.slider("Projected Minutes", 10, 48, 32)
 
-# --- 5. EXECUTION ---
+# --- 6. EXECUTION ---
 
 if app_mode == "Single Player":
     query = st.text_input("Search Player", "Marcus Smart")
@@ -164,7 +182,6 @@ if app_mode == "Single Player":
                 team_abbr = info['TEAM_ABBREVIATION'].iloc[0]
                 opp_abbr, is_home = get_live_matchup(team_abbr, team_map)
                 
-                # AUTOMATED LOGIC:
                 star_boost = calculate_dynamic_usage(team_abbr, injury_list)
                 total_usage_mult = manual_usage_boost + star_boost
                 
@@ -172,22 +189,22 @@ if app_mode == "Single Player":
                     st.warning(f"⚡ Star Out detected! Applied +{int(star_boost*100)}% Auto-Usage Boost for {team_abbr} players.")
 
                 if not p_df.empty:
-                    season_rate = p_df[f'{stat_cat}_per_min'].mean()
-                    last5_rate = p_df.head(5)[f'{stat_cat}_per_min'].mean()
-                    weighted_rate = (last5_rate * recency_weight) + (season_rate * (1 - recency_weight))
-                    dvp_mult = calculate_dvp(info['POSITION'].iloc[0], opp_abbr)
-                    t_pace = context_data.get(team_abbr, {}).get('raw_pace', lg_avg_pace)
-                    o_pace = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace)
-                    pace_mult = ((t_pace + o_pace) / 2) / lg_avg_pace
+                    dvp_m = calculate_dvp(info['POSITION'].iloc[0], opp_abbr)
+                    t_p = context_data.get(team_abbr, {}).get('raw_pace', lg_avg_pace)
+                    o_p = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace)
+                    p_m = ((t_p + o_p) / 2) / lg_avg_pace
                     
-                    st_lambda = weighted_rate * proj_minutes * dvp_mult * pace_mult * total_usage_mult
+                    # Using the robust projection logic
+                    st_lambda, s_avg = get_refined_projection(
+                        p_df, proj_minutes, stat_cat, recency_weight, 
+                        total_usage_mult, dvp_m, p_m
+                    )
                     
-                    # Dashboard UI
                     st.divider()
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Matchup", f"{team_abbr} vs {opp_abbr}")
-                    c2.metric("Projected", f"{round(st_lambda, 2)}")
-                    c3.metric("Total Multiplier", f"{round(dvp_mult * pace_mult * total_usage_mult, 2)}x")
+                    c2.metric("Projected", f"{st_lambda}")
+                    c3.metric("Total Multiplier", f"{round(dvp_m * p_m * total_usage_mult, 2)}x")
                     c4.metric("Usage Applied", f"{round(total_usage_mult, 2)}x")
 
                     col_l, col_m, col_r = st.columns([1, 1, 1])
@@ -199,8 +216,8 @@ if app_mode == "Single Player":
                     with col_m:
                         st.plotly_chart(plot_scout_radar(team_abbr, opp_abbr, context_data), use_container_width=True)
                     with col_r:
-                        variance_scale = 0.15 if stat_cat == 'points' else 0.05
-                        samples = np.random.gamma(st_lambda / (1 + st_lambda * variance_scale), 1 + st_lambda * variance_scale, 10000)
+                        v_scale = 0.15 if stat_cat == 'points' else 0.05
+                        samples = np.random.gamma(st_lambda / (1 + st_lambda * v_scale), 1 + st_lambda * v_scale, 10000)
                         sims = np.random.poisson(samples)
                         fig_mc = go.Figure(data=[go.Histogram(x=sims, nbinsx=max(15, int(st_lambda)), marker_color='#00CC96', opacity=0.7)])
                         fig_mc.update_layout(template="plotly_dark", height=350)
@@ -215,7 +232,6 @@ else:
 
     if st.session_state.trigger_scan:
         opp_abbr, is_home = get_live_matchup(team_choice, team_map)
-        # AUTO-BOOST CALCULATION FOR SCANNER
         star_boost = calculate_dynamic_usage(team_choice, injury_list)
         total_usage_mult = manual_usage_boost + star_boost
         
@@ -225,13 +241,27 @@ else:
             if row['PLAYER'] in injury_list: continue
             p_df = get_player_stats(row['PLAYER_ID'])
             if not p_df.empty:
-                w_rate = (p_df.head(5)[f'{stat_cat}_per_min'].mean() * recency_weight) + (p_df[f'{stat_cat}_per_min'].mean() * (1 - recency_weight))
-                proj = w_rate * proj_minutes * calculate_dvp(row['POSITION'], opp_abbr) * total_usage_mult
-                scan_results.append({"Player": row['PLAYER'], "Proj": round(proj, 1), "Edge": round(proj - p_df[stat_cat].mean(), 1)})
+                dvp_m = calculate_dvp(row['POSITION'], opp_abbr)
+                t_p = context_data.get(team_choice, {}).get('raw_pace', lg_avg_pace)
+                o_p = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace)
+                p_m = ((t_p + o_p) / 2) / lg_avg_pace
+                
+                # Robust Projection call
+                proj, avg = get_refined_projection(
+                    p_df, proj_minutes, stat_cat, recency_weight, 
+                    total_usage_mult, dvp_m, p_m
+                )
+                
+                scan_results.append({
+                    "Player": row['PLAYER'], 
+                    "Proj": proj, 
+                    "Season": avg,
+                    "Edge": round(proj - avg, 1)
+                })
         
         if scan_results:
             df_res = pd.DataFrame(scan_results).sort_values(by="Edge", ascending=False)
             st.dataframe(df_res.style.background_gradient(subset=['Edge'], cmap='RdYlGn'), use_container_width=True)
-            fig_edge = go.Figure(go.Bar(x=df_res['Player'], y=df_res['Edge'], marker_color='#00CC96'))
+            fig_edge = go.Figure(go.Bar(x=df_res['Player'], y=df_res['Edge'], marker_color=['#00CC96' if x > 0 else '#EF553B' for x in df_res['Edge']]))
             st.plotly_chart(fig_edge, use_container_width=True)
         st.session_state.trigger_scan = False
