@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, scoreboardv2
 
-# --- 1. CORE ENGINE (Preserved Logic) ---
+# --- 1. CORE ENGINE (Preserved & Enhanced) ---
 
 def get_live_matchup(team_abbr, team_map):
     default_return = (None, True) 
@@ -26,7 +26,7 @@ def get_live_matchup(team_abbr, team_map):
                 opp_id = game.iloc[0]['VISITOR_TEAM_ID'] if is_home else game.iloc[0]['HOME_TEAM_ID']
                 opp_abbr = next((abbr for abbr, tid in team_map.items() if tid == opp_id), "OPP")
                 return opp_abbr, is_home
-    except Exception as e: st.sidebar.error(f"API Matchup Error: {e}")
+    except Exception as e: st.sidebar.error(f"Matchup Error: {e}")
     return default_return 
 
 @st.cache_data(ttl=3600)
@@ -43,9 +43,10 @@ def get_league_context():
 def get_player_stats(p_id):
     try:
         info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
+        # Pulling 2025-26 logs
         log = playergamelog.PlayerGameLog(player_id=p_id, season='2025-26').get_data_frames()[0]
         if not log.empty:
-            log = log.rename(columns={'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'FGA': 'fga', 'FTA': 'fta', 'TOV': 'tov', 'MIN': 'minutes'})
+            log = log.rename(columns={'MATCHUP': 'matchup', 'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'FGA': 'fga', 'FTA': 'fta', 'TOV': 'tov', 'MIN': 'minutes'})
             log = log[log['minutes'] > 8]
             log['pra'] = log['points'] + log['rebounds'] + log['assists']
             for cat in ['points', 'rebounds', 'assists', 'three_pointers', 'pra']:
@@ -63,15 +64,54 @@ def calculate_dvp_multiplier(pos, opp_abbr):
     pos_key = 'Guard' if 'Guard' in pos else ('Center' if 'Center' in pos else 'Forward')
     return dvp_map.get(pos_key, {}).get(opp_abbr, 1.0)
 
-# --- 2. RESTORED VISUALIZATION ENGINE ---
+# --- 2. H2H & RECOMMENDATION LOGIC ---
+
+def get_h2h_performance(p_df, opp_abbr, stat_cat):
+    if not opp_abbr or p_df.empty: return None
+    # Filter log for matchups containing the opponent abbreviation
+    h2h_games = p_df[p_df['matchup'].str.contains(opp_abbr)]
+    if h2h_games.empty: return None
+    return {
+        'count': len(h2h_games),
+        'avg': h2h_games[stat_cat].mean(),
+        'last': h2h_games[stat_cat].iloc[0]
+    }
+
+def get_smart_recommendations(mu, line, win_p, p_df, stat_cat, opp_abbr, p10, h2h_data):
+    recs = []
+    edge = (mu - line) / line if line > 0 else 0
+    top_5_def = ['OKC', 'DET', 'BOS', 'MIA', 'PHI']
+    
+    # 1. High Confidence
+    if win_p > 0.62 and edge > 0.20:
+        recs.append({"label": "🔥 PRO SIGNAL", "val": f"{round(edge*100)}% Edge detected", "type": "success"})
+    
+    # 2. H2H History (New Refinement)
+    if h2h_data and h2h_data['count'] > 0:
+        if h2h_data['avg'] > line * 1.1:
+            recs.append({"label": "⚔️ H2H DOMINANCE", "val": f"Avg {round(h2h_data['avg'],1)} vs {opp_abbr}", "type": "success"})
+        elif h2h_data['avg'] < line * 0.9:
+            recs.append({"label": "❄️ H2H STRUGGLE", "val": f"Avg {round(h2h_data['avg'],1)} vs {opp_abbr}", "type": "error"})
+
+    # 3. Defensive Context
+    if opp_abbr in top_5_def:
+        recs.append({"label": "🛡️ DEFENSE ALERT", "val": f"{opp_abbr} is Elite Defense", "type": "error"})
+    
+    # 4. Safety Check
+    if p10 >= line:
+        recs.append({"label": "💎 SAFETY FLOOR", "val": "Bottom 10% Sim covers line", "type": "success"})
+        
+    return recs
+
+# --- 3. VISUALIZATION ---
 
 def plot_poisson_chart(mu, line, cat):
     x = np.arange(0, max(mu * 2.5, line + 5))
     y = poisson.pmf(x, mu)
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=x, y=y, name="Probability", marker_color='rgba(100, 149, 237, 0.6)'))
+    fig.add_trace(go.Bar(x=x, y=y, name="Prob", marker_color='rgba(100, 149, 237, 0.6)'))
     fig.add_vline(x=line - 0.5, line_dash="dash", line_color="red", annotation_text=f"Line: {line}")
-    fig.update_layout(title=f"Poisson Hit Probability: {cat.upper()}", template="plotly_dark", height=300, margin=dict(l=10, r=10, t=40, b=10))
+    fig.update_layout(title=f"Poisson Hit Prob: {cat.upper()}", template="plotly_dark", height=280, margin=dict(l=10, r=10, t=40, b=10))
     return fig
 
 def plot_monte_carlo(mu, line):
@@ -79,111 +119,77 @@ def plot_monte_carlo(mu, line):
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=sims, nbinsx=30, marker_color='#636EFA', opacity=0.7))
     p10, p90 = np.percentile(sims, 10), np.percentile(sims, 90)
-    fig.add_vline(x=line, line_color="red", line_width=3, annotation_text="Market")
-    fig.add_vline(x=p10, line_color="orange", line_dash="dot", annotation_text="Floor")
-    fig.add_vline(x=p90, line_color="cyan", line_dash="dot", annotation_text="Ceiling")
-    fig.update_layout(title="Monte Carlo (10,000 Sims)", template="plotly_dark", height=300, margin=dict(l=10, r=10, t=40, b=10))
+    fig.add_vline(x=line, line_color="red", line_width=3)
+    fig.update_layout(title="Monte Carlo (10k Sims)", template="plotly_dark", height=280, margin=dict(l=10, r=10, t=40, b=10))
     return fig, p10, p90
 
-# --- 3. REFINED RECOMMENDATION LOGIC ---
+# --- 4. APP LAYOUT ---
 
-def get_smart_recommendations(mu, line, win_p, p_df, stat_cat, opp_abbr, p10):
-    recs = []
-    edge = (mu - line) / line if line > 0 else 0
-    top_5_def = ['OKC', 'DET', 'BOS', 'MIA', 'PHI']
-    
-    # Logic 1: High Confidence Over
-    if win_p > 0.60 and edge > 0.18:
-        recs.append({"label": "🔥 HIGH CONFIDENCE OVER", "val": f"{round(edge*100)}% Edge vs Market", "type": "success"})
-    
-    # Logic 2: Defensive Warning (New Refinement)
-    if opp_abbr in top_5_def:
-        recs.append({"label": "🛡️ ELITE DEFENSE ALERT", "val": f"Opponent {opp_abbr} is a Top 5 Defense", "type": "error"})
-    
-    # Logic 3: Form Check
-    last_5 = p_df[stat_cat].head(5).mean()
-    if last_5 > line * 1.2:
-        recs.append({"label": "📈 HOT STREAK", "val": f"L5 Avg ({round(last_5,1)}) > Market Line", "type": "info"})
-    
-    # Logic 4: Safety Floor
-    if p10 >= line:
-        recs.append({"label": "💎 SAFETY BET", "val": "10% Simulation Floor covers the line", "type": "success"})
-        
-    return recs
-
-# --- 4. LAYOUT & UI ---
-st.set_page_config(page_title="Sharp Pro v5.4", layout="wide")
+st.set_page_config(page_title="Sharp Pro v5.5", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 
 with st.sidebar:
-    st.title("🛡️ Pro Hub v5.4")
+    st.title("🛡️ Sharp Pro v5.5")
     total_purse = st.number_input("Purse ($)", value=1000)
     kelly_mult = st.slider("Kelly Fraction", 0.1, 1.0, 0.5)
     st.divider()
-    mode = st.radio("Switch View", ["Single Player", "Team Scout Radar"])
-    stat_cat = st.selectbox("Stat Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
-    st.subheader("Contextual Toggles")
+    stat_cat = st.selectbox("Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     proj_minutes = st.slider("Projected Minutes", 10, 48, 30)
-    is_b2b = st.checkbox("Player on Back-to-Back?", value=False)
-    injury_impact = st.slider("Global Injury Boost %", 0, 25, 0) / 100 + 1.0
+    is_b2b = st.checkbox("Back-to-Back?", value=False)
+    vol_boost = st.checkbox("Volatility Mode", value=True)
 
-if mode == "Single Player":
-    c_s1, c_s2, c_s3 = st.columns([2, 2, 1])
-    with c_s1: query = st.text_input("Search Name", "Alexandre Sarr")
-    with c_s2:
-        matches = [p for p in players.get_players() if query.lower() in p['full_name'].lower()]
-        player_choice = st.selectbox("Confirm Identity", matches, format_func=lambda x: x['full_name'])
-    with c_s3: vol_boost = st.checkbox("Volatility Mode", value=True)
+query = st.text_input("Search Player", "Alexandre Sarr")
+matches = [p for p in players.get_players() if query.lower() in p['full_name'].lower()]
+player_choice = st.selectbox("Select Player", matches, format_func=lambda x: x['full_name'])
 
-    if player_choice:
-        p_df, team_abbr, pos, height = get_player_stats(player_choice['id'])
-        opp_abbr, is_home = get_live_matchup(team_abbr, team_map)
+if player_choice:
+    p_df, team_abbr, pos, height = get_player_stats(player_choice['id'])
+    opp_abbr, is_home = get_live_matchup(team_abbr, team_map)
+    
+    if not p_df.empty:
+        # Adjustment Logic
+        per_min_val = p_df[f'{stat_cat}_per_min'].mean()
+        baseline = per_min_val * proj_minutes
+        dvp_mult = calculate_dvp_multiplier(pos or "Forward", opp_abbr)
+        pace_mult = (((context_data.get(team_abbr, {}).get('raw_pace', 99) + context_data.get(opp_abbr, {}).get('raw_pace', 99)) / 2) / lg_avg_pace) if opp_abbr else 1.0
         
-        if not p_df.empty:
-            per_min_val = p_df[f'{stat_cat}_per_min'].mean()
-            baseline = per_min_val * proj_minutes
-            fatigue_mult = 0.94 if is_b2b else 1.0
-            dvp_mult = calculate_dvp_multiplier(pos or "Guard", opp_abbr)
-            home_adv = 1.03 if is_home else 0.97
-            p_pace = context_data.get(team_abbr, {}).get('raw_pace', lg_avg_pace)
-            o_pace = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace) if opp_abbr else lg_avg_pace
-            pace_mult = ((p_pace + o_pace) / 2) / lg_avg_pace
-            sos_adj = context_data.get(opp_abbr, {}).get('sos', 1.0) if opp_abbr else 1.0
-            st_lambda = baseline * fatigue_mult * dvp_mult * injury_impact * sos_adj * pace_mult * home_adv * (1.10 if vol_boost else 1.0)
-            
-            st.divider()
-            if opp_abbr: st.success(f"📅 **Matchup Found:** {team_abbr} vs {opp_abbr} | DvP: {dvp_mult}x")
-            else: st.warning("⚠️ No game found. Using neutral metrics.")
+        st_lambda = baseline * dvp_mult * pace_mult * (0.94 if is_b2b else 1.0) * (1.1 if vol_boost else 1.0)
+        
+        # UI Metrics
+        st.divider()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Matchup", f"{team_abbr} vs {opp_abbr}" if opp_abbr else "No Matchup Found")
+        c2.metric("Proj. Lambda", round(st_lambda, 2))
+        c3.metric("DvP Adj", f"{dvp_mult}x")
+        c4.metric("Season Avg", round(p_df[stat_cat].mean(), 1))
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Pos", pos); m2.metric("Stat/Min", round(per_min_val, 3)); m3.metric("Proj. Line", round(st_lambda, 1)); m4.metric("Avg Mins", round(p_df['minutes'].mean(), 1))
+        # Inputs
+        b1, b2, b3 = st.columns([2, 1, 1])
+        curr_line = b1.number_input("Market Line", value=float(round(st_lambda, 1)), step=0.5)
+        win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
+        b2.metric("Win Probability", f"{round(win_p*100, 1)}%")
+        stake = max(0, total_purse * kelly_mult * (win_p - (1 - win_p)))
+        b3.metric("Kelly Stake", f"${round(stake, 2)}")
 
-            b1, b2, b3 = st.columns([2, 1, 1])
-            curr_line = b1.number_input("Vegas Line", value=float(round(st_lambda, 1)), step=0.5)
-            win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
-            b2.metric("Win Prob", f"{round(win_p*100, 1)}%")
-            stake = max(0, total_purse * kelly_mult * (win_p - (1 - win_p)))
-            b3.metric("Rec. Stake", f"${round(stake, 2)}")
+        # Charts
+        col_l, col_r = st.columns(2)
+        with col_l: st.plotly_chart(plot_poisson_chart(st_lambda, curr_line, stat_cat), use_container_width=True)
+        with col_r:
+            mc_fig, p10, p90 = plot_monte_carlo(st_lambda, curr_line)
+            st.plotly_chart(mc_fig, use_container_width=True)
 
-            # RESTORED CHARTS
-            col_l, col_r = st.columns(2)
-            with col_l:
-                st.plotly_chart(plot_poisson_chart(st_lambda, curr_line, stat_cat), use_container_width=True)
-            with col_r:
-                mc_fig, p10, p90 = plot_monte_carlo(st_lambda, curr_line)
-                st.plotly_chart(mc_fig, use_container_width=True)
-
-            # REFINED RECOMMENDED LEGS
-            st.subheader("🎯 Smart Prop Intelligence")
-            recs = get_smart_recommendations(st_lambda, curr_line, win_p, p_df, stat_cat, opp_abbr, p10)
-            
-            if recs:
-                r_cols = st.columns(len(recs))
-                for idx, r in enumerate(recs):
-                    with r_cols[idx]:
-                        if r['type'] == "success": st.success(f"**{r['label']}**\n\n{r['val']}")
-                        elif r['type'] == "error": st.error(f"**{r['label']}**\n\n{r['val']}")
-                        else: st.info(f"**{r['label']}**\n\n{r['val']}")
-            else:
-                st.info("No high-probability signals detected for this specific line.")
+        # H2H and Recs
+        h2h_data = get_h2h_performance(p_df, opp_abbr, stat_cat)
+        st.subheader("🎯 Smart Prop Recommendations")
+        recs = get_smart_recommendations(st_lambda, curr_line, win_p, p_df, stat_cat, opp_abbr, p10, h2h_data)
+        
+        if recs:
+            r_cols = st.columns(len(recs))
+            for idx, r in enumerate(recs):
+                with r_cols[idx]:
+                    if r['type'] == "success": st.success(f"**{r['label']}**\n\n{r['val']}")
+                    elif r['type'] == "error": st.error(f"**{r['label']}**\n\n{r['val']}")
+                    else: st.info(f"**{r['label']}**\n\n{r['val']}")
+        else:
+            st.info("No standout trends for this line.")
