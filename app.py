@@ -132,7 +132,7 @@ def plot_poisson_chart(mu, line, cat):
     return fig
 
 # --- 5. APP SETUP ---
-st.set_page_config(page_title="Sharp Pro v7.4", layout="wide")
+st.set_page_config(page_title="Sharp Pro v7.5", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 injury_list = get_automated_injury_list()
@@ -141,7 +141,7 @@ if 'trigger_scan' not in st.session_state:
     st.session_state.trigger_scan = False
 
 with st.sidebar:
-    st.title("🚀 Sharp Pro v7.4")
+    st.title("🚀 Sharp Pro v7.5")
     st.info(f"📋 **Injury Tracker Active:** {len(injury_list)} OUT.")
     app_mode = st.radio("Analysis Mode", ["Single Player", "Team Value Scanner"])
     st.divider()
@@ -150,7 +150,6 @@ with st.sidebar:
     recency_weight = st.slider("Recency Bias", 0.0, 1.0, 0.3)
     manual_usage_boost = st.slider("Manual Usage Tweak", 1.0, 1.3, 1.0, 0.05)
     
-    # NEW: Bench Filter for Team Scanner
     st.divider()
     st.subheader("Scanner Filters")
     min_mpg_filter = st.slider("Min MPG (Scanner Only)", 0, 40, 10)
@@ -213,8 +212,24 @@ if app_mode == "Single Player":
                         v_scale = 0.15 if stat_cat == 'points' else 0.05
                         samples = np.random.gamma(st_lambda / (1 + st_lambda * v_scale), 1 + st_lambda * v_scale, 10000)
                         sims = np.random.poisson(samples)
-                        fig_mc = go.Figure(data=[go.Histogram(x=sims, nbinsx=max(15, int(st_lambda)), marker_color='#00CC96', opacity=0.7)])
-                        fig_mc.update_layout(template="plotly_dark", height=350)
+                        
+                        # --- UPDATED MONTE CARLO CHART WITH MARKET LINE ---
+                        fig_mc = go.Figure(data=[go.Histogram(
+                            x=sims, 
+                            nbinsx=max(15, int(st_lambda)), 
+                            marker_color='#00CC96', 
+                            opacity=0.7,
+                            name='Simulated Games'
+                        )])
+                        # Re-inserting the Market Line
+                        fig_mc.add_vline(x=curr_line - 0.5, line_dash="dash", line_color="#FF4B4B", annotation_text="Market")
+                        fig_mc.update_layout(
+                            title=f"Monte Carlo: {stat_cat.upper()}",
+                            template="plotly_dark", 
+                            height=350,
+                            margin=dict(l=10, r=10, t=40, b=10),
+                            showlegend=False
+                        )
                         st.plotly_chart(fig_mc, use_container_width=True)
 
 else:
@@ -236,7 +251,6 @@ else:
             p_df = get_player_stats(row['PLAYER_ID'])
             
             if not p_df.empty:
-                # CHECK MIN MPG FILTER
                 actual_mpg = p_df['minutes'].mean()
                 if actual_mpg < min_mpg_filter:
                     continue
