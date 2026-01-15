@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from scipy.stats import poisson
 from datetime import datetime, timedelta
 import pytz
+import time
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, scoreboardv2, commonteamroster
 
@@ -34,7 +35,6 @@ def get_live_matchup(team_abbr, team_map):
 def get_league_context():
     try:
         stats = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced', season='2025-26').get_data_frames()[0]
-        avg_def = stats['DEF_RATING'].mean()
         avg_pace = stats['PACE'].mean()
         context_map = {row['TEAM_ABBREVIATION']: {
             'raw_pace': row['PACE'], 'off_rtg': row['OFF_RATING'], 'def_rtg': row['DEF_RATING'],
@@ -91,12 +91,16 @@ def plot_poisson_chart(mu, line, cat):
 
 # --- 3. APP SETUP ---
 
-st.set_page_config(page_title="Sharp Pro v5.95", layout="wide")
+st.set_page_config(page_title="Sharp Pro v6.0", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 
+# Initialize state to prevent auto-run on selectbox change
+if 'trigger_scan' not in st.session_state:
+    st.session_state.trigger_scan = False
+
 with st.sidebar:
-    st.title("🛡️ Sharp Pro v5.95")
+    st.title("🛡️ Sharp Pro v6.0")
     app_mode = st.radio("Analysis Mode", ["Single Player", "Team Value Scanner"])
     st.divider()
     stat_cat = st.selectbox("Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
@@ -117,13 +121,11 @@ if app_mode == "Single Player":
         opp_abbr, is_home = get_live_matchup(team_abbr, team_map)
         
         if not p_df.empty:
-            # Baseline Projection Logic
             rate = p_df[f'{stat_cat}_per_min'].mean()
             dvp_mult = calculate_dvp(info['POSITION'].iloc[0], opp_abbr)
             pace_mult = (((context_data.get(team_abbr, {}).get('raw_pace', 99) + context_data.get(opp_abbr, {}).get('raw_pace', 99)) / 2) / lg_avg_pace) if opp_abbr else 1.0
             st_lambda = rate * proj_minutes * dvp_mult * pace_mult * (1.1 if vol_boost else 1.0)
             
-            # Top Metrics
             st.divider()
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Matchup", f"{team_abbr} {'vs' if is_home else '@'} {opp_abbr}")
@@ -153,7 +155,6 @@ if app_mode == "Single Player":
                 fig_mc.update_layout(template="plotly_dark", height=350, margin=dict(l=10, r=10, t=10, b=10))
                 st.plotly_chart(fig_mc, use_container_width=True)
             
-            # Recommended Legs Section
             st.divider()
             st.subheader("💡 Recommended Legs (Based on 10k Sims)")
             leg_cols = st.columns(3)
@@ -169,11 +170,55 @@ if app_mode == "Single Player":
                 st.info(f"**Ladder Leg:** {player_choice['full_name']} {ladder_line}+ {stat_cat} ({round(ladder_p*100)}% prob)")
 
 else:
-    # [Team Value Scanner logic from previous version goes here...]
     st.header("📋 Team Value Scanner")
     team_choice = st.selectbox("Select Team", sorted(list(team_map.keys())))
-    if team_choice:
-        opp_abbr, is_home = get_live_matchup(team_choice, team_map)
-        st.subheader(f"Scanning {team_choice} Roster vs {opp_abbr}")
-        roster = commonteamroster.CommonTeamRoster(team_id=team_map[team_choice]).get_data_frames()[0]
-        # (Full scanner logic remains the same for the team view)
+    
+    # NEW: Trigger Button with Session State
+    if st.button("🚀 Start Team Value Scan", type="primary"):
+        st.session_state.trigger_scan = True
+
+    if st.session_state.trigger_scan:
+        with st.spinner(f"🔍 Analyzing {team_choice} roster... this may take a moment."):
+            opp_abbr, is_home = get_live_matchup(team_choice, team_map)
+            roster = commonteamroster.CommonTeamRoster(team_id=team_map[team_choice]).get_data_frames()[0]
+            
+            scan_results = []
+            # Scan top 8 players (typically the core rotation)
+            for index, row in roster.head(8).iterrows():
+                p_id = row['PLAYER_ID']
+                p_name = row['PLAYER']
+                pos = row['POSITION']
+                
+                p_df = get_player_stats(p_id)
+                if not p_df.empty:
+                    rate = p_df[f'{stat_cat}_per_min'].mean()
+                    dvp = calculate_dvp(pos, opp_abbr)
+                    # Baseline calculation for scan comparisons
+                    proj = rate * proj_minutes * dvp * (1.1 if vol_boost else 1.0)
+                    avg = p_df[stat_cat].mean()
+                    edge = proj - avg
+                    
+                    scan_results.append({
+                        "Player": p_name,
+                        "Position": pos,
+                        "Projected": round(proj, 1),
+                        "Season Avg": round(avg, 1),
+                        "Expected Edge": round(edge, 1)
+                    })
+            
+            if scan_results:
+                df_results = pd.DataFrame(scan_results).sort_values(by="Expected Edge", ascending=False)
+                st.subheader(f"Scanner Results: {team_choice} vs {opp_abbr}")
+                st.table(df_results)
+                
+                # Visual summary
+                fig_edge = go.Figure(go.Bar(
+                    x=df_results['Player'], 
+                    y=df_results['Expected Edge'],
+                    marker_color=['green' if x > 0 else 'red' for x in df_results['Expected Edge']]
+                ))
+                fig_edge.update_layout(title="Projected Value vs Season Average", template="plotly_dark")
+                st.plotly_chart(fig_edge, use_container_width=True)
+            
+            # Reset state so it doesn't auto-run if sidebar settings change
+            st.session_state.trigger_scan = False
