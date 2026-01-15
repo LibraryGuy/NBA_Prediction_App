@@ -43,7 +43,6 @@ def get_league_context():
 def get_player_stats(p_id):
     try:
         info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
-        # Pulling 2025-26 logs
         log = playergamelog.PlayerGameLog(player_id=p_id, season='2025-26').get_data_frames()[0]
         if not log.empty:
             log = log.rename(columns={'MATCHUP': 'matchup', 'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'FGA': 'fga', 'FTA': 'fta', 'TOV': 'tov', 'MIN': 'minutes'})
@@ -64,40 +63,52 @@ def calculate_dvp_multiplier(pos, opp_abbr):
     pos_key = 'Guard' if 'Guard' in pos else ('Center' if 'Center' in pos else 'Forward')
     return dvp_map.get(pos_key, {}).get(opp_abbr, 1.0)
 
-# --- 2. H2H & RECOMMENDATION LOGIC ---
+# --- 2. BAYESIAN & H2H LOGIC ---
+
+def get_bayesian_adjusted_rate(p_df, stat_cat):
+    """Calculates a Bayesian Posterior Rate by weighting Season Avg vs L5 Hot Streak"""
+    if p_df.empty: return 0.0
+    
+    # Prior (Season Long)
+    prior_mu = p_df[f'{stat_cat}_per_min'].mean()
+    prior_var = p_df[f'{stat_cat}_per_min'].var() or 0.01
+    
+    # Evidence (Last 5 Games)
+    recent_data = p_df.head(5)[f'{stat_cat}_per_min']
+    evidence_mu = recent_data.mean()
+    evidence_var = recent_data.var() or 0.01
+    
+    # Bayesian Update: (Prior_Precision * Prior_Mu + Evidence_Precision * Evidence_Mu) / Total_Precision
+    # Precision = 1 / Variance
+    w_prior = 1 / prior_var
+    w_evidence = 1 / evidence_var
+    
+    posterior_mu = (w_prior * prior_mu + w_evidence * evidence_mu) / (w_prior + w_evidence)
+    return posterior_mu
 
 def get_h2h_performance(p_df, opp_abbr, stat_cat):
     if not opp_abbr or p_df.empty: return None
-    # Filter log for matchups containing the opponent abbreviation
     h2h_games = p_df[p_df['matchup'].str.contains(opp_abbr)]
     if h2h_games.empty: return None
-    return {
-        'count': len(h2h_games),
-        'avg': h2h_games[stat_cat].mean(),
-        'last': h2h_games[stat_cat].iloc[0]
-    }
+    return {'count': len(h2h_games), 'avg': h2h_games[stat_cat].mean(), 'last': h2h_games[stat_cat].iloc[0]}
 
 def get_smart_recommendations(mu, line, win_p, p_df, stat_cat, opp_abbr, p10, h2h_data):
     recs = []
     edge = (mu - line) / line if line > 0 else 0
     top_5_def = ['OKC', 'DET', 'BOS', 'MIA', 'PHI']
     
-    # 1. High Confidence
     if win_p > 0.62 and edge > 0.20:
         recs.append({"label": "🔥 PRO SIGNAL", "val": f"{round(edge*100)}% Edge detected", "type": "success"})
     
-    # 2. H2H History (New Refinement)
     if h2h_data and h2h_data['count'] > 0:
         if h2h_data['avg'] > line * 1.1:
             recs.append({"label": "⚔️ H2H DOMINANCE", "val": f"Avg {round(h2h_data['avg'],1)} vs {opp_abbr}", "type": "success"})
         elif h2h_data['avg'] < line * 0.9:
             recs.append({"label": "❄️ H2H STRUGGLE", "val": f"Avg {round(h2h_data['avg'],1)} vs {opp_abbr}", "type": "error"})
 
-    # 3. Defensive Context
     if opp_abbr in top_5_def:
         recs.append({"label": "🛡️ DEFENSE ALERT", "val": f"{opp_abbr} is Elite Defense", "type": "error"})
     
-    # 4. Safety Check
     if p10 >= line:
         recs.append({"label": "💎 SAFETY FLOOR", "val": "Bottom 10% Sim covers line", "type": "success"})
         
@@ -125,12 +136,12 @@ def plot_monte_carlo(mu, line):
 
 # --- 4. APP LAYOUT ---
 
-st.set_page_config(page_title="Sharp Pro v5.5", layout="wide")
+st.set_page_config(page_title="Sharp Pro v5.6", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 
 with st.sidebar:
-    st.title("🛡️ Sharp Pro v5.5")
+    st.title("🛡️ Sharp Pro v5.6")
     total_purse = st.number_input("Purse ($)", value=1000)
     kelly_mult = st.slider("Kelly Fraction", 0.1, 1.0, 0.5)
     st.divider()
@@ -148,9 +159,10 @@ if player_choice:
     opp_abbr, is_home = get_live_matchup(team_abbr, team_map)
     
     if not p_df.empty:
-        # Adjustment Logic
-        per_min_val = p_df[f'{stat_cat}_per_min'].mean()
-        baseline = per_min_val * proj_minutes
+        # Adjustment Logic with Bayesian Smoothing
+        bayes_per_min = get_bayesian_adjusted_rate(p_df, stat_cat)
+        baseline = bayes_per_min * proj_minutes
+        
         dvp_mult = calculate_dvp_multiplier(pos or "Forward", opp_abbr)
         pace_mult = (((context_data.get(team_abbr, {}).get('raw_pace', 99) + context_data.get(opp_abbr, {}).get('raw_pace', 99)) / 2) / lg_avg_pace) if opp_abbr else 1.0
         
@@ -160,7 +172,7 @@ if player_choice:
         st.divider()
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Matchup", f"{team_abbr} vs {opp_abbr}" if opp_abbr else "No Matchup Found")
-        c2.metric("Proj. Lambda", round(st_lambda, 2))
+        c2.metric("Bayesian Proj", round(st_lambda, 2), delta=f"{round((bayes_per_min - p_df[f'{stat_cat}_per_min'].mean())*proj_minutes, 1)} Hot/Cold Adj")
         c3.metric("DvP Adj", f"{dvp_mult}x")
         c4.metric("Season Avg", round(p_df[stat_cat].mean(), 1))
 
