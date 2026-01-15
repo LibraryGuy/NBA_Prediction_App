@@ -19,7 +19,6 @@ def get_league_context():
         avg_def = stats['DEF_RATING'].mean()
         avg_pace = stats['PACE'].mean()
         
-        # Create a combined lookup for SOS and Pace
         context_map = {}
         for _, row in stats.iterrows():
             context_map[row['TEAM_ABBREVIATION']] = {
@@ -46,6 +45,7 @@ def get_player_stats(p_id):
 
 def get_live_matchup(team_abbr, team_map):
     try:
+        # Static date for simulation; update to datetime.now() for production
         board = scoreboardv2.ScoreboardV2(game_date='2026-01-14').get_data_frames()[0]
         t_id = team_map.get(team_abbr)
         game = board[(board['HOME_TEAM_ID'] == t_id) | (board['VISITOR_TEAM_ID'] == t_id)]
@@ -87,21 +87,16 @@ if mode == "Single Player":
         if not p_df.empty:
             p_mean = p_df[stat_cat].mean()
             
-            # PACE ADJUSTMENT LOGIC
-            # Expected Pace = (Player Team Pace + Opponent Pace) / 2
             p_team_pace = context_data.get(team_abbr, {}).get('raw_pace', lg_avg_pace)
             o_team_pace = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace)
             matchup_pace = (p_team_pace + o_team_pace) / 2
             pace_multiplier = matchup_pace / lg_avg_pace
-            
-            # SOS Adjustment
             current_sos = context_data.get(opp_abbr, {}).get('sos', 1.0)
 
             st.divider()
             if opp_abbr:
-                st.success(f"📅 **Matchup:** {team_abbr} vs {opp_abbr} | Pace: **{round(matchup_pace, 1)}** ({round(pace_multiplier, 2)}x Vol) | SOS: **{round(current_sos, 2)}x**")
+                st.success(f"📅 **Matchup:** {team_abbr} vs {opp_abbr} | Pace: **{round(matchup_pace, 1)}** | SOS: **{round(current_sos, 2)}x**")
             
-            # REST OF DASHBOARD (Identical Metrics & Layout)
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Player", f"{team_abbr} | {pos}")
             m2.metric("Season Avg", round(p_mean, 1))
@@ -112,14 +107,12 @@ if mode == "Single Player":
             curr_line = b1.number_input("Vegas Line", value=float(round(p_mean, 1)))
             
             home_adv = 1.03 if is_home else 0.97
-            # THE SHARP FORMULA
             st_lambda = p_mean * (1.10 if vol_boost else 1.0) * injury_impact * current_sos * pace_multiplier * home_adv
             
             win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
             b2.metric("Win Prob", f"{round(win_p*100, 1)}%")
             b3.metric("Rec. Stake", f"${round(total_purse * kelly_mult * 0.05, 2)}")
 
-            # Visuals
             st.divider()
             t_col, e_col = st.columns(2)
             with t_col:
@@ -131,11 +124,69 @@ if mode == "Single Player":
                 fig_e.update_layout(title="Efficiency Matrix", template="plotly_dark", height=300)
                 st.plotly_chart(fig_e, use_container_width=True)
 
-            st.write("### 🎯 Full-Scale Outcome Distribution (Pace & SOS Adjusted)")
+            st.write("### 🎯 Full-Scale Outcome Distribution")
             sims = np.random.poisson(st_lambda, 10000)
             fig_mc = go.Figure(go.Histogram(x=sims, nbinsx=35, marker_color='#00ff96', opacity=0.6))
             fig_mc.add_vline(x=curr_line, line_color="red", line_dash="dash", line_width=4)
             fig_mc.update_layout(template="plotly_dark", height=450)
             st.plotly_chart(fig_mc, use_container_width=True)
 
-# (Team Scout logic continues with pace_multiplier incorporated into Proj...)
+# --- 4. MODE: TEAM SCOUT RADAR (RECOVERY FIXED) ---
+elif mode == "Team Scout Radar":
+    st.header("🚀 Team Scout Radar")
+    sel_team = st.selectbox("Select Team to Scan", sorted(list(team_map.keys())))
+    
+    if st.button("Generate Roster Analysis"):
+        with st.spinner(f"Analyzing {sel_team} roster against live schedule..."):
+            try:
+                roster_data = commonteamroster.CommonTeamRoster(team_id=team_map[sel_team]).get_data_frames()[0]
+                radar_data = []
+                
+                opp, home = get_live_matchup(sel_team, team_map)
+                
+                # Global Context for Team
+                p_team_pace = context_data.get(sel_team, {}).get('raw_pace', lg_avg_pace)
+                o_team_pace = context_data.get(opp, {}).get('raw_pace', lg_avg_pace) if opp else lg_avg_pace
+                matchup_pace = (p_team_pace + o_team_pace) / 2
+                pace_multiplier = matchup_pace / lg_avg_pace
+                sos_adj = context_data.get(opp, {}).get('sos', 1.0) if opp else 1.0
+                home_factor = 1.03 if home else 0.97
+
+                # Scan Roster
+                for _, row in roster_data.head(10).iterrows():
+                    try:
+                        p_log, _, _, _ = get_player_stats(row['PLAYER_ID'])
+                        if not p_log.empty:
+                            m = p_log[stat_cat].mean()
+                            proj = m * injury_impact * sos_adj * pace_multiplier * home_factor
+                            # Edge calculation (Probability of hitting over the season average)
+                            prob = (1 - poisson.cdf(m - 0.5, proj)) * 100
+                            
+                            radar_data.append({
+                                "Player": row['PLAYER'], 
+                                "Avg": round(m, 1), 
+                                "Proj": round(proj, 1), 
+                                "Win%": f"{round(prob, 1)}%"
+                            })
+                    except: continue
+
+                if radar_data:
+                    df_radar = pd.DataFrame(radar_data)
+                    c1, c2 = st.columns([1, 1])
+                    with c1:
+                        st.subheader("📋 Projections")
+                        st.dataframe(df_radar, use_container_width=True, hide_index=True)
+                    with c2:
+                        st.subheader(f"📊 Prob vs {opp if opp else 'League Avg'}")
+                        df_radar['WinVal'] = df_radar['Win%'].str.replace('%','').astype(float)
+                        fig_radar = go.Figure(go.Bar(x=df_radar['Player'], y=df_radar['WinVal'], marker_color='#00ff96'))
+                        fig_radar.update_layout(template="plotly_dark", height=400)
+                        st.plotly_chart(fig_radar, use_container_width=True)
+                else:
+                    st.warning("No data found for this team's current roster.")
+            except Exception as e:
+                st.error(f"Error loading radar: {e}")
+
+# --- 5. MODE: BOX SCORE SCRAPER (STUB) ---
+elif mode == "Box Score Scraper":
+    st.info("Box Score Scraper logic can be implemented here.")
