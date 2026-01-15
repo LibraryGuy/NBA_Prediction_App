@@ -213,7 +213,6 @@ if app_mode == "Single Player":
                         samples = np.random.gamma(st_lambda / (1 + st_lambda * v_scale), 1 + st_lambda * v_scale, 10000)
                         sims = np.random.poisson(samples)
                         
-                        # --- UPDATED MONTE CARLO CHART WITH MARKET LINE ---
                         fig_mc = go.Figure(data=[go.Histogram(
                             x=sims, 
                             nbinsx=max(15, int(st_lambda)), 
@@ -221,7 +220,6 @@ if app_mode == "Single Player":
                             opacity=0.7,
                             name='Simulated Games'
                         )])
-                        # Re-inserting the Market Line
                         fig_mc.add_vline(x=curr_line - 0.5, line_dash="dash", line_color="#FF4B4B", annotation_text="Market")
                         fig_mc.update_layout(
                             title=f"Monte Carlo: {stat_cat.upper()}",
@@ -231,6 +229,28 @@ if app_mode == "Single Player":
                             showlegend=False
                         )
                         st.plotly_chart(fig_mc, use_container_width=True)
+
+                    # --- RECOMMENDED PARLAY LEGS ADDED BACK HERE ---
+                    st.divider()
+                    st.subheader(f"🎯 Recommended {player_choice['full_name']} Parlay Legs")
+                    leg_cols = st.columns(3)
+                    
+                    # Generate 3 conservative legs based on current projection
+                    # Leg 1: 75% of projection (High Confidence)
+                    # Leg 2: 90% of projection (Standard)
+                    # Leg 3: PRA alternative or 100% projection
+                    potential_lines = [round(st_lambda * 0.7, 1), round(st_lambda * 0.85, 1), round(st_lambda * 0.95, 1)]
+                    
+                    for i, line in enumerate(potential_lines):
+                        prob = (1 - poisson.cdf(line - 0.5, st_lambda))
+                        with leg_cols[i]:
+                            st.markdown(f"""
+                            <div style="padding:15px; border-radius:10px; border:1px solid #444; background-color:#1e1e1e;">
+                                <h4 style="margin:0; color:#00CC96;">Alt Line {i+1}</h4>
+                                <p style="font-size:20px; margin:5px 0;">{line}+ {stat_cat.title()}</p>
+                                <p style="color:#888;">Confidence: <b>{round(prob*100, 1)}%</b></p>
+                            </div>
+                            """, unsafe_with_html=True)
 
 else:
     st.header("📋 Team Value Scanner")
