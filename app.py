@@ -3,50 +3,51 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from scipy.stats import poisson
-from datetime import datetime # Added for dynamic date handling
+from datetime import datetime, timedelta # Added timedelta for the window fix
 from nba_api.stats.static import players, teams
-from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, commonteamroster, scoreboardv2
+from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, scoreboardv2
 
 # --- 1. CORE ENGINE (REPAIR & UPGRADE) ---
 
 def get_live_matchup(team_abbr, team_map):
-    """Hardened function to prevent unpacking errors."""
-    # Default fallback values
+    """Hardened function to catch late-night games and prevent unpacking errors."""
     default_return = (None, True) 
     
     try:
-        # Use current system date for real-time tracking
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        
-        # Fetch scoreboard with timeout to prevent hanging
-        sb = scoreboardv2.ScoreboardV2(game_date=today_str)
-        board_dfs = sb.get_data_frames()
-        
-        if not board_dfs:
-            return default_return
-            
-        board = board_dfs[0]
         t_id = team_map.get(team_abbr)
-        
         if not t_id:
             return default_return
 
-        # Check for team in either Home or Visitor slots
-        game = board[(board['HOME_TEAM_ID'] == t_id) | (board['VISITOR_TEAM_ID'] == t_id)]
+        # LOGIC: Check Today and Tomorrow to account for EST/Local Timezone rollovers
+        # Late night games (like Wizards @ Clippers at 10:30 PM) often trigger this.
+        check_dates = [
+            datetime.now().strftime('%Y-%m-%d'),
+            (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        ]
         
-        if not game.empty:
-            is_home = (game.iloc[0]['HOME_TEAM_ID'] == t_id)
-            opp_id = game.iloc[0]['VISITOR_TEAM_ID'] if is_home else game.iloc[0]['HOME_TEAM_ID']
+        for date_str in check_dates:
+            sb = scoreboardv2.ScoreboardV2(game_date=date_str)
+            board_dfs = sb.get_data_frames()
             
-            # Map the opponent ID back to an Abbreviation
-            opp_abbr = next((abbr for abbr, tid in team_map.items() if tid == opp_id), "OPP")
-            return opp_abbr, is_home
+            if not board_dfs or board_dfs[0].empty:
+                continue
+                
+            board = board_dfs[0]
+            game = board[(board['HOME_TEAM_ID'] == t_id) | (board['VISITOR_TEAM_ID'] == t_id)]
             
+            if not game.empty:
+                is_home = (game.iloc[0]['HOME_TEAM_ID'] == t_id)
+                opp_id = game.iloc[0]['VISITOR_TEAM_ID'] if is_home else game.iloc[0]['HOME_TEAM_ID']
+                
+                # Map the opponent ID back to an Abbreviation
+                opp_abbr = next((abbr for abbr, tid in team_map.items() if tid == opp_id), "OPP")
+                return opp_abbr, is_home
+                
     except Exception as e:
-        # Silently log error to console for debugging
-        print(f"API Matchup Error: {e}")
+        # Log error to Streamlit for transparency if the API fails
+        st.sidebar.error(f"API Matchup Error: {e}")
         
-    return default_return # Guaranteed tuple for unpacking
+    return default_return 
 
 @st.cache_data(ttl=3600)
 def get_league_context():
@@ -69,7 +70,6 @@ def get_league_context():
             }
         return context_map, avg_pace
     except Exception:
-        # If API fails, return neutral values
         return {t['abbreviation']: {'sos': 1.0, 'pace_factor': 1.0, 'raw_pace': 99.0} for t in teams.get_teams()}, 99.0
 
 @st.cache_data(ttl=600)
@@ -81,7 +81,6 @@ def get_player_stats(p_id):
         
         if not log.empty:
             log = log.rename(columns={'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'FGA': 'fga', 'FTA': 'fta', 'TOV': 'tov', 'MIN': 'minutes'})
-            # Filter garbage time
             log = log[log['minutes'] > 8]
             
             log['pra'] = log['points'] + log['rebounds'] + log['assists']
@@ -96,9 +95,9 @@ def get_player_stats(p_id):
 def calculate_dvp_multiplier(pos, opp_abbr):
     """Logic for Position-specific defensive adjustments."""
     dvp_map = {
-        'Center': {'OKC': 0.85, 'MIN': 0.88, 'UTA': 1.15, 'WAS': 1.20},
-        'Guard': {'BOS': 0.88, 'OKC': 0.85, 'HOU': 0.92, 'CHA': 1.12},
-        'Forward': {'NYK': 0.90, 'MIA': 0.92, 'DET': 1.08}
+        'Center': {'OKC': 0.85, 'MIN': 0.88, 'UTA': 1.15, 'WAS': 1.20, 'LAC': 0.95},
+        'Guard': {'BOS': 0.88, 'OKC': 0.85, 'HOU': 0.92, 'CHA': 1.12, 'LAC': 0.92},
+        'Forward': {'NYK': 0.90, 'MIA': 0.92, 'DET': 1.08, 'LAC': 0.94}
     }
     pos_key = 'Guard' if 'Guard' in pos else ('Center' if 'Center' in pos else 'Forward')
     return dvp_map.get(pos_key, {}).get(opp_abbr, 1.0)
@@ -133,48 +132,41 @@ if mode == "Single Player":
     if player_choice:
         p_df, team_abbr, pos, height = get_player_stats(player_choice['id'])
         
-        # ROBUST CALL: This will now always return two values
+        # This will now check a 2-day window to catch the 10:30pm Clippers game
         opp_abbr, is_home = get_live_matchup(team_abbr, team_map)
         
         if not p_df.empty:
-            # Baseline from Per-Minute stats
             per_min_val = p_df[f'{stat_cat}_per_min'].mean()
             baseline = per_min_val * proj_minutes
             
-            # Multipliers
             fatigue_mult = 0.94 if is_b2b else 1.0
             dvp_mult = calculate_dvp_multiplier(pos or "Guard", opp_abbr)
             home_adv = 1.03 if is_home else 0.97
             
-            # Matchup Pace/SOS
             p_pace = context_data.get(team_abbr, {}).get('raw_pace', lg_avg_pace)
             o_pace = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace) if opp_abbr else lg_avg_pace
             pace_mult = ((p_pace + o_pace) / 2) / lg_avg_pace
             sos_adj = context_data.get(opp_abbr, {}).get('sos', 1.0) if opp_abbr else 1.0
             
-            # Final Projection
             st_lambda = baseline * fatigue_mult * dvp_mult * injury_impact * sos_adj * pace_mult * home_adv * (1.10 if vol_boost else 1.0)
             
-            # UI Output
             st.divider()
             if opp_abbr:
-                st.success(f"📅 **Matchup:** {team_abbr} vs {opp_abbr} | DvP: {dvp_mult}x | Fatigue: {fatigue_mult}x")
+                st.success(f"📅 **Matchup Found:** {team_abbr} vs {opp_abbr} | DvP: {dvp_mult}x | Fatigue: {fatigue_mult}x")
             else:
-                st.warning(f"⚠️ No game found for {team_abbr} today. Displaying neutral projections.")
+                st.warning(f"⚠️ No game found for {team_abbr} in the immediate window. Using neutral metrics.")
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Pos", pos)
             m2.metric("Stat/Min", round(per_min_val, 3))
             m3.metric("Proj. Line", round(st_lambda, 1))
-            m4.metric("Avg Minutes", round(p_df['minutes'].mean(), 1))
+            m4.metric("Season Avg Mins", round(p_df['minutes'].mean(), 1))
 
-            # Betting Logic
             b1, b2, b3 = st.columns([2, 1, 1])
             curr_line = b1.number_input("Vegas Line", value=float(round(st_lambda, 1)))
             win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
             
             b2.metric("Win Prob", f"{round(win_p*100, 1)}%")
-            # Kelly Criterion Stake
             edge = win_p - (1 - win_p)
             stake = max(0, total_purse * kelly_mult * edge)
             b3.metric("Rec. Stake", f"${round(stake, 2)}")
