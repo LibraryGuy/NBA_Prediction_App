@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, scoreboardv2
 
-# --- 1. CORE ENGINE (Preserved & Enhanced) ---
+# --- 1. CORE ENGINE ---
 
 def get_live_matchup(team_abbr, team_map):
     default_return = (None, True) 
@@ -32,18 +32,27 @@ def get_live_matchup(team_abbr, team_map):
 @st.cache_data(ttl=3600)
 def get_league_context():
     try:
-        stats = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced', season='2025-26').get_data_frames()[0]
+        stats = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced', season='2024-25').get_data_frames()[0]
         avg_def = stats['DEF_RATING'].mean()
         avg_pace = stats['PACE'].mean()
-        context_map = {row['TEAM_ABBREVIATION']: {'sos': row['DEF_RATING'] / avg_def, 'pace_factor': row['PACE'] / avg_pace, 'raw_pace': row['PACE']} for _, row in stats.iterrows()}
+        # Full context for Radar and Multipliers
+        context_map = {row['TEAM_ABBREVIATION']: {
+            'sos': row['DEF_RATING'] / avg_def, 
+            'pace_factor': row['PACE'] / avg_pace, 
+            'raw_pace': row['PACE'],
+            'off_rtg': row['OFF_RATING'],
+            'def_rtg': row['DEF_RATING'],
+            'ast_pct': row['AST_PCT'],
+            'reb_pct': row['REB_PCT']
+        } for _, row in stats.iterrows()}
         return context_map, avg_pace
-    except Exception: return {t['abbreviation']: {'sos': 1.0, 'pace_factor': 1.0, 'raw_pace': 99.0} for t in teams.get_teams()}, 99.0
+    except Exception: return {t['abbreviation']: {'sos': 1.0, 'pace_factor': 1.0, 'raw_pace': 99.0, 'off_rtg': 115, 'def_rtg': 115, 'ast_pct': 0.6, 'reb_pct': 0.5} for t in teams.get_teams()}, 99.0
 
 @st.cache_data(ttl=600)
 def get_player_stats(p_id):
     try:
         info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
-        log = playergamelog.PlayerGameLog(player_id=p_id, season='2025-26').get_data_frames()[0]
+        log = playergamelog.PlayerGameLog(player_id=p_id, season='2024-25').get_data_frames()[0]
         if not log.empty:
             log = log.rename(columns={'MATCHUP': 'matchup', 'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'FGA': 'fga', 'FTA': 'fta', 'TOV': 'tov', 'MIN': 'minutes'})
             log = log[log['minutes'] > 8]
@@ -63,28 +72,20 @@ def calculate_dvp_multiplier(pos, opp_abbr):
     pos_key = 'Guard' if 'Guard' in pos else ('Center' if 'Center' in pos else 'Forward')
     return dvp_map.get(pos_key, {}).get(opp_abbr, 1.0)
 
-# --- 2. BAYESIAN & H2H LOGIC ---
+# --- 2. LOGIC MODULES ---
 
 def get_bayesian_adjusted_rate(p_df, stat_cat):
-    """Calculates a Bayesian Posterior Rate by weighting Season Avg vs L5 Hot Streak"""
     if p_df.empty: return 0.0
-    
-    # Prior (Season Long)
     prior_mu = p_df[f'{stat_cat}_per_min'].mean()
     prior_var = p_df[f'{stat_cat}_per_min'].var() or 0.01
-    
-    # Evidence (Last 5 Games)
     recent_data = p_df.head(5)[f'{stat_cat}_per_min']
     evidence_mu = recent_data.mean()
     evidence_var = recent_data.var() or 0.01
     
-    # Bayesian Update: (Prior_Precision * Prior_Mu + Evidence_Precision * Evidence_Mu) / Total_Precision
-    # Precision = 1 / Variance
+    # Bayesian Precision Weighting
     w_prior = 1 / prior_var
     w_evidence = 1 / evidence_var
-    
-    posterior_mu = (w_prior * prior_mu + w_evidence * evidence_mu) / (w_prior + w_evidence)
-    return posterior_mu
+    return (w_prior * prior_mu + w_evidence * evidence_mu) / (w_prior + w_evidence)
 
 def get_h2h_performance(p_df, opp_abbr, stat_cat):
     if not opp_abbr or p_df.empty: return None
@@ -95,26 +96,31 @@ def get_h2h_performance(p_df, opp_abbr, stat_cat):
 def get_smart_recommendations(mu, line, win_p, p_df, stat_cat, opp_abbr, p10, h2h_data):
     recs = []
     edge = (mu - line) / line if line > 0 else 0
-    top_5_def = ['OKC', 'DET', 'BOS', 'MIA', 'PHI']
-    
     if win_p > 0.62 and edge > 0.20:
         recs.append({"label": "🔥 PRO SIGNAL", "val": f"{round(edge*100)}% Edge detected", "type": "success"})
-    
     if h2h_data and h2h_data['count'] > 0:
         if h2h_data['avg'] > line * 1.1:
             recs.append({"label": "⚔️ H2H DOMINANCE", "val": f"Avg {round(h2h_data['avg'],1)} vs {opp_abbr}", "type": "success"})
-        elif h2h_data['avg'] < line * 0.9:
-            recs.append({"label": "❄️ H2H STRUGGLE", "val": f"Avg {round(h2h_data['avg'],1)} vs {opp_abbr}", "type": "error"})
-
-    if opp_abbr in top_5_def:
-        recs.append({"label": "🛡️ DEFENSE ALERT", "val": f"{opp_abbr} is Elite Defense", "type": "error"})
-    
     if p10 >= line:
         recs.append({"label": "💎 SAFETY FLOOR", "val": "Bottom 10% Sim covers line", "type": "success"})
-        
     return recs
 
-# --- 3. VISUALIZATION ---
+# --- 3. VISUALIZATION MODULES ---
+
+def plot_scout_radar(team_abbr, opp_abbr, context_data):
+    categories = ['Offense', 'Defense', 'Pace', 'Passing', 'Rebounding']
+    
+    def get_team_metrics(abbr):
+        d = context_data.get(abbr, {'off_rtg': 110, 'def_rtg': 110, 'raw_pace': 99, 'ast_pct': 0.6, 'reb_pct': 0.5})
+        return [d['off_rtg']/120, (140-d['def_rtg'])/40, d['raw_pace']/105, d['ast_pct'], d['reb_pct']]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(r=get_team_metrics(team_abbr), theta=categories, fill='toself', name=team_abbr, line_color='#636EFA'))
+    if opp_abbr:
+        fig.add_trace(go.Scatterpolar(r=get_team_metrics(opp_abbr), theta=categories, fill='toself', name=opp_abbr, line_color='#EF553B'))
+    
+    fig.update_layout(polar=dict(radialaxis=dict(visible=False)), template="plotly_dark", height=350, margin=dict(l=40, r=40, t=40, b=40), showlegend=True)
+    return fig
 
 def plot_poisson_chart(mu, line, cat):
     x = np.arange(0, max(mu * 2.5, line + 5))
@@ -136,12 +142,12 @@ def plot_monte_carlo(mu, line):
 
 # --- 4. APP LAYOUT ---
 
-st.set_page_config(page_title="Sharp Pro v5.6", layout="wide")
+st.set_page_config(page_title="Sharp Pro v5.7", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 
 with st.sidebar:
-    st.title("🛡️ Sharp Pro v5.6")
+    st.title("🛡️ Sharp Pro v5.7")
     total_purse = st.number_input("Purse ($)", value=1000)
     kelly_mult = st.slider("Kelly Fraction", 0.1, 1.0, 0.5)
     st.divider()
@@ -159,10 +165,9 @@ if player_choice:
     opp_abbr, is_home = get_live_matchup(team_abbr, team_map)
     
     if not p_df.empty:
-        # Adjustment Logic with Bayesian Smoothing
+        # Adjustment Logic
         bayes_per_min = get_bayesian_adjusted_rate(p_df, stat_cat)
         baseline = bayes_per_min * proj_minutes
-        
         dvp_mult = calculate_dvp_multiplier(pos or "Forward", opp_abbr)
         pace_mult = (((context_data.get(team_abbr, {}).get('raw_pace', 99) + context_data.get(opp_abbr, {}).get('raw_pace', 99)) / 2) / lg_avg_pace) if opp_abbr else 1.0
         
@@ -176,18 +181,23 @@ if player_choice:
         c3.metric("DvP Adj", f"{dvp_mult}x")
         c4.metric("Season Avg", round(p_df[stat_cat].mean(), 1))
 
-        # Inputs
-        b1, b2, b3 = st.columns([2, 1, 1])
-        curr_line = b1.number_input("Market Line", value=float(round(st_lambda, 1)), step=0.5)
-        win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
-        b2.metric("Win Probability", f"{round(win_p*100, 1)}%")
-        stake = max(0, total_purse * kelly_mult * (win_p - (1 - win_p)))
-        b3.metric("Kelly Stake", f"${round(stake, 2)}")
-
-        # Charts
-        col_l, col_r = st.columns(2)
-        with col_l: st.plotly_chart(plot_poisson_chart(st_lambda, curr_line, stat_cat), use_container_width=True)
-        with col_r:
+        # Core Dashboard Row
+        row1_left, row1_right = st.columns([1, 1])
+        with row1_left:
+            st.subheader("📊 Probability Analysis")
+            b1, b2 = st.columns(2)
+            curr_line = b1.number_input("Market Line", value=float(round(st_lambda, 1)), step=0.5)
+            win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
+            b2.metric("Win Probability", f"{round(win_p*100, 1)}%")
+            
+            stake = max(0, total_purse * kelly_mult * (win_p - (1 - win_p)))
+            st.metric("Kelly Recommendation", f"${round(stake, 2)}")
+            
+            st.plotly_chart(plot_poisson_chart(st_lambda, curr_line, stat_cat), use_container_width=True)
+        
+        with row1_right:
+            st.subheader("📡 Team Scouting Radar")
+            st.plotly_chart(plot_scout_radar(team_abbr, opp_abbr, context_data), use_container_width=True)
             mc_fig, p10, p90 = plot_monte_carlo(st_lambda, curr_line)
             st.plotly_chart(mc_fig, use_container_width=True)
 
@@ -201,7 +211,6 @@ if player_choice:
             for idx, r in enumerate(recs):
                 with r_cols[idx]:
                     if r['type'] == "success": st.success(f"**{r['label']}**\n\n{r['val']}")
-                    elif r['type'] == "error": st.error(f"**{r['label']}**\n\n{r['val']}")
-                    else: st.info(f"**{r['label']}**\n\n{r['val']}")
+                    else: st.error(f"**{r['label']}**\n\n{r['val']}")
         else:
             st.info("No standout trends for this line.")
