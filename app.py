@@ -35,28 +35,17 @@ def calculate_dynamic_usage(team_abbr, injury_list):
 # --- 2. SAMPLE SIZE & ROBUST PROJECTION ENGINE ---
 
 def get_refined_projection(p_df, proj_minutes, stat_cat, weight, usage_boost, dvp, pace):
-    """
-    Calculates projection with a safety buffer for low-sample bench players.
-    Ensures players with small garbage-time samples don't break the scanner.
-    """
     if p_df.empty: return 0.0, 0.0
     
-    # Calculate raw rates
     season_rate = p_df[f'{stat_cat}_per_min'].mean()
     last5_rate = p_df.head(5)[f'{stat_cat}_per_min'].mean()
     weighted_rate = (last5_rate * weight) + (season_rate * (1 - weight))
     
-    # --- SAMPLE SIZE PROTECTION ---
     total_minutes_played = p_df['minutes'].sum()
-    total_games = len(p_df)
-    
-    # Reliability Cap: If player has < 100 total mins, scale their rate down 
-    # to prevent outlier spikes from small samples (The N'Faly Dante Fix)
     reliability_cap = 1.0
     if total_minutes_played < 100:
         reliability_cap = max(0.1, total_minutes_played / 100)
     
-    # Apply context multipliers
     st_lambda = weighted_rate * proj_minutes * dvp * pace * usage_boost * reliability_cap
     season_avg = p_df[stat_cat].mean()
     
@@ -143,7 +132,7 @@ def plot_poisson_chart(mu, line, cat):
     return fig
 
 # --- 5. APP SETUP ---
-st.set_page_config(page_title="Sharp Pro v7.3", layout="wide")
+st.set_page_config(page_title="Sharp Pro v7.4", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 injury_list = get_automated_injury_list()
@@ -152,7 +141,7 @@ if 'trigger_scan' not in st.session_state:
     st.session_state.trigger_scan = False
 
 with st.sidebar:
-    st.title("🚀 Sharp Pro v7.3")
+    st.title("🚀 Sharp Pro v7.4")
     st.info(f"📋 **Injury Tracker Active:** {len(injury_list)} OUT.")
     app_mode = st.radio("Analysis Mode", ["Single Player", "Team Value Scanner"])
     st.divider()
@@ -160,6 +149,12 @@ with st.sidebar:
     stat_cat = st.selectbox("Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
     recency_weight = st.slider("Recency Bias", 0.0, 1.0, 0.3)
     manual_usage_boost = st.slider("Manual Usage Tweak", 1.0, 1.3, 1.0, 0.05)
+    
+    # NEW: Bench Filter for Team Scanner
+    st.divider()
+    st.subheader("Scanner Filters")
+    min_mpg_filter = st.slider("Min MPG (Scanner Only)", 0, 40, 10)
+    
     st.divider()
     total_purse = st.number_input("Purse ($)", value=1000)
     kelly_mult = st.slider("Kelly Fraction", 0.1, 1.0, 0.25)
@@ -194,7 +189,6 @@ if app_mode == "Single Player":
                     o_p = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace)
                     p_m = ((t_p + o_p) / 2) / lg_avg_pace
                     
-                    # Using the robust projection logic
                     st_lambda, s_avg = get_refined_projection(
                         p_df, proj_minutes, stat_cat, recency_weight, 
                         total_usage_mult, dvp_m, p_m
@@ -240,13 +234,18 @@ else:
         for _, row in roster.iterrows():
             if row['PLAYER'] in injury_list: continue
             p_df = get_player_stats(row['PLAYER_ID'])
+            
             if not p_df.empty:
+                # CHECK MIN MPG FILTER
+                actual_mpg = p_df['minutes'].mean()
+                if actual_mpg < min_mpg_filter:
+                    continue
+
                 dvp_m = calculate_dvp(row['POSITION'], opp_abbr)
                 t_p = context_data.get(team_choice, {}).get('raw_pace', lg_avg_pace)
                 o_p = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace)
                 p_m = ((t_p + o_p) / 2) / lg_avg_pace
                 
-                # Robust Projection call
                 proj, avg = get_refined_projection(
                     p_df, proj_minutes, stat_cat, recency_weight, 
                     total_usage_mult, dvp_m, p_m
@@ -254,6 +253,7 @@ else:
                 
                 scan_results.append({
                     "Player": row['PLAYER'], 
+                    "MPG": round(actual_mpg, 1),
                     "Proj": proj, 
                     "Season": avg,
                     "Edge": round(proj - avg, 1)
