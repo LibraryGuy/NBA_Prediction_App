@@ -16,7 +16,6 @@ def get_live_matchup(team_abbr, team_map):
         if not t_id: return None, True
         tz = pytz.timezone('US/Eastern')
         now = datetime.now(tz)
-        # Check today and yesterday for active slate
         dates_to_check = [now.strftime('%Y-%m-%d'), (now - timedelta(days=1)).strftime('%Y-%m-%d')]
         for date_str in dates_to_check:
             sb = scoreboardv2.ScoreboardV2(game_date=date_str, league_id='00')
@@ -34,7 +33,6 @@ def get_live_matchup(team_abbr, team_map):
 @st.cache_data(ttl=3600)
 def get_league_context():
     try:
-        # Using 2024-25 as current active season
         stats = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced', season='2024-25').get_data_frames()[0]
         avg_pace = stats['PACE'].mean()
         context_map = {row['TEAM_ABBREVIATION']: {
@@ -50,7 +48,7 @@ def get_player_stats(p_id):
         log = playergamelog.PlayerGameLog(player_id=p_id, season='2024-25').get_data_frames()[0]
         if not log.empty:
             log = log.rename(columns={'MATCHUP': 'matchup', 'PTS': 'points', 'REB': 'rebounds', 'AST': 'assists', 'FG3M': 'three_pointers', 'MIN': 'minutes'})
-            log = log[log['minutes'] > 5] # Lowered threshold to catch bench spark plugs
+            log = log[log['minutes'] > 5]
             log['pra'] = log['points'] + log['rebounds'] + log['assists']
             for cat in ['points', 'rebounds', 'assists', 'three_pointers', 'pra']:
                 log[f'{cat}_per_min'] = log[cat] / log['minutes'].replace(0, 1)
@@ -59,7 +57,6 @@ def get_player_stats(p_id):
     return pd.DataFrame()
 
 def calculate_dvp(pos, opp_abbr):
-    """Upgraded DvP with more team coverage"""
     dvp_map = {
         'Center': {'OKC': 0.82, 'MIN': 0.85, 'WAS': 1.18, 'UTA': 1.12, 'CHA': 1.15, 'GSW': 0.95},
         'Guard': {'BOS': 0.88, 'OKC': 0.84, 'CHA': 1.14, 'WAS': 1.10, 'DET': 1.08, 'ORL': 0.90},
@@ -94,9 +91,9 @@ def plot_poisson_chart(mu, line, cat):
     fig.update_layout(title=f"Outcome Distribution: {cat.upper()}", template="plotly_dark", height=250, margin=dict(l=10, r=10, t=40, b=10))
     return fig
 
-# --- 3. APP SETUP & LOGIC UPGRADES ---
+# --- 3. APP SETUP ---
 
-st.set_page_config(page_title="Sharp Pro v7.0", layout="wide")
+st.set_page_config(page_title="Sharp Pro v7.1", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 
@@ -104,7 +101,7 @@ if 'trigger_scan' not in st.session_state:
     st.session_state.trigger_scan = False
 
 with st.sidebar:
-    st.title("🚀 Sharp Pro v7.0")
+    st.title("🚀 Sharp Pro v7.1")
     st.caption("Context-Aware Prediction Engine")
     app_mode = st.radio("Analysis Mode", ["Single Player", "Team Value Scanner"])
     st.divider()
@@ -135,19 +132,15 @@ if app_mode == "Single Player":
             opp_abbr, is_home = get_live_matchup(team_abbr, team_map)
             
             if not p_df.empty:
-                # LOGIC UPGRADE 1: Weighted Rate (Season vs Last 5)
                 season_rate = p_df[f'{stat_cat}_per_min'].mean()
                 last5_rate = p_df.head(5)[f'{stat_cat}_per_min'].mean()
                 weighted_rate = (last5_rate * recency_weight) + (season_rate * (1 - recency_weight))
                 
-                # LOGIC UPGRADE 2: DvP & Enhanced Pace Factor
                 dvp_mult = calculate_dvp(info['POSITION'].iloc[0], opp_abbr)
-                
                 t_pace = context_data.get(team_abbr, {}).get('raw_pace', lg_avg_pace)
                 o_pace = context_data.get(opp_abbr, {}).get('raw_pace', lg_avg_pace)
                 pace_mult = ((t_pace + o_pace) / 2) / lg_avg_pace
                 
-                # Final Projection (Lambda)
                 st_lambda = weighted_rate * proj_minutes * dvp_mult * pace_mult * usage_boost
                 
                 st.divider()
@@ -164,8 +157,7 @@ if app_mode == "Single Player":
                     win_p = (1 - poisson.cdf(curr_line - 0.5, st_lambda))
                     st.metric("Win Probability", f"{round(win_p*100, 1)}%")
                     
-                    # Kelly Criterion Calculation
-                    b = 0.90 # Simplified odds (approx -110)
+                    b = 0.90 
                     q = 1 - win_p
                     kelly_f = max(0, (win_p - q/b))
                     stake = total_purse * kelly_f * kelly_mult
@@ -179,8 +171,6 @@ if app_mode == "Single Player":
 
                 with col_r:
                     st.subheader("🎲 Monte Carlo (10k)")
-                    # LOGIC UPGRADE: Variance Scaling (Overdispersion)
-                    # We use a Gamma distribution to vary lambda, creating a Negative Binomial effect
                     variance_scale = 0.15 if stat_cat == 'points' else 0.05
                     samples = np.random.gamma(st_lambda / (1 + st_lambda * variance_scale), 1 + st_lambda * variance_scale, 10000)
                     sims = np.random.poisson(samples)
@@ -190,6 +180,37 @@ if app_mode == "Single Player":
                     fig_mc.update_layout(template="plotly_dark", height=350, margin=dict(l=10, r=10, t=10, b=10))
                     st.plotly_chart(fig_mc, use_container_width=True)
                 
+                # --- NEW: HEAD TO HEAD SECTION ---
+                st.divider()
+                st.subheader(f"⚔️ Head-to-Head History: vs {opp_abbr}")
+                
+                # Filter logs for games against this opponent
+                h2h_df = p_df[p_df['matchup'].str.contains(opp_abbr)].copy()
+                
+                if not h2h_df.empty:
+                    hc1, hc2, hc3 = st.columns([1, 1, 2])
+                    h2h_avg = h2h_df[stat_cat].mean()
+                    h2h_hits = len(h2h_df[h2h_df[stat_cat] > curr_line])
+                    hit_rate = (h2h_hits / len(h2h_df)) * 100
+                    
+                    hc1.metric("H2H Average", f"{round(h2h_avg, 1)} {stat_cat}")
+                    hc2.metric("H2H Hit Rate", f"{round(hit_rate)}%", f"{h2h_hits}/{len(h2h_df)} Games")
+                    
+                    with hc3:
+                        # Mini H2H Chart
+                        h2h_fig = go.Figure(go.Bar(
+                            x=h2h_df['GAME_DATE'], 
+                            y=h2h_df[stat_cat],
+                            marker_color='#636EFA',
+                            text=h2h_df[stat_cat],
+                            textposition='auto'
+                        ))
+                        h2h_fig.add_hline(y=curr_line, line_dash="dash", line_color="red")
+                        h2h_fig.update_layout(template="plotly_dark", height=200, margin=dict(l=0,r=0,t=20,b=0), title="Points by Game Date")
+                        st.plotly_chart(h2h_fig, use_container_width=True)
+                else:
+                    st.warning(f"No H2H matchups found for {player_choice['full_name']} vs {opp_abbr} in the 2024-25 season logs.")
+
                 st.divider()
                 st.subheader("💡 Recommended Betting Legs")
                 leg_cols = st.columns(3)
@@ -217,7 +238,6 @@ else:
             roster = commonteamroster.CommonTeamRoster(team_id=team_map[team_choice]).get_data_frames()[0]
             
             scan_results = []
-            # Scanning top 10 players for deeper bench value
             for index, row in roster.head(10).iterrows():
                 p_id = row['PLAYER_ID']
                 p_name = row['PLAYER']
@@ -225,7 +245,6 @@ else:
                 
                 p_df = get_player_stats(p_id)
                 if not p_df.empty:
-                    # Apply the same Weighted Logic as Single Player
                     s_rate = p_df[f'{stat_cat}_per_min'].mean()
                     l5_rate = p_df.head(5)[f'{stat_cat}_per_min'].mean()
                     w_rate = (l5_rate * recency_weight) + (s_rate * (1 - recency_weight))
