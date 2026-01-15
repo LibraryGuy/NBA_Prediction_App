@@ -91,16 +91,15 @@ def plot_poisson_chart(mu, line, cat):
 
 # --- 3. APP SETUP ---
 
-st.set_page_config(page_title="Sharp Pro v6.0", layout="wide")
+st.set_page_config(page_title="Sharp Pro v6.2", layout="wide")
 team_map = {t['abbreviation']: t['id'] for t in teams.get_teams()}
 context_data, lg_avg_pace = get_league_context()
 
-# Initialize state to prevent auto-run on selectbox change
 if 'trigger_scan' not in st.session_state:
     st.session_state.trigger_scan = False
 
 with st.sidebar:
-    st.title("🛡️ Sharp Pro v6.0")
+    st.title("🛡️ Sharp Pro v6.2")
     app_mode = st.radio("Analysis Mode", ["Single Player", "Team Value Scanner"])
     st.divider()
     stat_cat = st.selectbox("Category", ["points", "rebounds", "assists", "three_pointers", "pra"])
@@ -173,17 +172,15 @@ else:
     st.header("📋 Team Value Scanner")
     team_choice = st.selectbox("Select Team", sorted(list(team_map.keys())))
     
-    # NEW: Trigger Button with Session State
     if st.button("🚀 Start Team Value Scan", type="primary"):
         st.session_state.trigger_scan = True
 
     if st.session_state.trigger_scan:
-        with st.spinner(f"🔍 Analyzing {team_choice} roster... this may take a moment."):
+        with st.spinner(f"🔍 Analyzing {team_choice} roster and momentum... this may take a moment."):
             opp_abbr, is_home = get_live_matchup(team_choice, team_map)
             roster = commonteamroster.CommonTeamRoster(team_id=team_map[team_choice]).get_data_frames()[0]
             
             scan_results = []
-            # Scan top 8 players (typically the core rotation)
             for index, row in roster.head(8).iterrows():
                 p_id = row['PLAYER_ID']
                 p_name = row['PLAYER']
@@ -193,25 +190,30 @@ else:
                 if not p_df.empty:
                     rate = p_df[f'{stat_cat}_per_min'].mean()
                     dvp = calculate_dvp(pos, opp_abbr)
-                    # Baseline calculation for scan comparisons
+                    
                     proj = rate * proj_minutes * dvp * (1.1 if vol_boost else 1.0)
                     avg = p_df[stat_cat].mean()
+                    
+                    # ADDED: Last 5 Games Calculation
+                    l5_avg = p_df.head(5)[stat_cat].mean() if len(p_df) >= 5 else avg
                     edge = proj - avg
                     
                     scan_results.append({
                         "Player": p_name,
-                        "Position": pos,
+                        "Pos": pos,
                         "Projected": round(proj, 1),
                         "Season Avg": round(avg, 1),
+                        "Last 5 Avg": round(l5_avg, 1),
                         "Expected Edge": round(edge, 1)
                     })
             
             if scan_results:
                 df_results = pd.DataFrame(scan_results).sort_values(by="Expected Edge", ascending=False)
                 st.subheader(f"Scanner Results: {team_choice} vs {opp_abbr}")
-                st.table(df_results)
                 
-                # Visual summary
+                # Apply background coloring for clarity
+                st.dataframe(df_results.style.background_gradient(subset=['Expected Edge'], cmap='RdYlGn'), use_container_width=True)
+                
                 fig_edge = go.Figure(go.Bar(
                     x=df_results['Player'], 
                     y=df_results['Expected Edge'],
@@ -220,5 +222,4 @@ else:
                 fig_edge.update_layout(title="Projected Value vs Season Average", template="plotly_dark")
                 st.plotly_chart(fig_edge, use_container_width=True)
             
-            # Reset state so it doesn't auto-run if sidebar settings change
             st.session_state.trigger_scan = False
