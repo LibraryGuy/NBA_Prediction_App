@@ -9,7 +9,7 @@ import requests
 import time
 from nba_api.stats.static import players, teams
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, scoreboardv2, commonteamroster
-from nba_api.library.http import NBAStatsHTTP
+from nba_api.stats.library.http import NBAStatsHTTP
 
 # --- FIX: Set Global Headers to avoid Timeout/Blocking ---
 # This mimics a real browser to prevent the NBA server from dropping the connection
