@@ -13,7 +13,6 @@ from nba_api.stats.static import players, teams
 
 @st.cache_data(ttl=1800)
 def get_intel():
-    # In a real app, this scrapes live; here it simulates for the demo
     return {
         "injuries": ["Nikola Jokic", "Kevin Durant", "Joel Embiid", "Ja Morant"],
         "ref_bias": {
@@ -46,20 +45,20 @@ def get_daily_schedule():
 
 # --- 2. DASHBOARD SETUP ---
 
-st.set_page_config(page_title="Sharp Pro v9.0", layout="wide")
+st.set_page_config(page_title="Sharp Pro v10.1", layout="wide")
 intel = get_intel()
 pace_map, avg_pace = get_pace()
 schedule = get_daily_schedule()
 team_lookup = {t['id']: t['abbreviation'] for t in teams.get_teams()}
 
 with st.sidebar:
-    st.title("🏀 Sharp Pro v9.0")
+    st.title("🏀 Sharp Pro v10.1")
     st.info(f"Cascading Logic: Enabled ✅")
     mode = st.radio("Navigation", ["Single Player Analysis", "Team Scanner"])
     stat_cat = st.selectbox("Stat Category", ["PTS", "REB", "AST", "PRA"])
     line = st.number_input("Sportsbook Line", value=22.5, step=0.5)
 
-# --- 3. MODE: SINGLE PLAYER ANALYSIS (All Features Intact) ---
+# --- 3. MODE: SINGLE PLAYER ANALYSIS ---
 
 if mode == "Single Player Analysis":
     search = st.text_input("Search Player", "Shai Gilgeous-Alexander")
@@ -80,16 +79,17 @@ if mode == "Single Player Analysis":
                 raw_avg = log[stat_cat].head(10).mean()
                 comp_pace = (pace_map.get(t_id, 100) + pace_map.get(game_info['opp'], 100)) / 2
                 
-                # INJURY CASCADING: Check if a teammate is OUT
+                # INJURY CASCADING
                 usage_boost = 1.0
                 team_roster = commonteamroster.CommonTeamRoster(team_id=t_id).get_data_frames()[0]
                 injured_teammates = [p for p in team_roster['PLAYER'] if p in intel['injuries']]
                 if len(injured_teammates) > 0:
-                    usage_boost = 1.12 # Apply 12% boost if team is short-handed
+                    usage_boost = 1.12 
                 
                 final_proj = raw_avg * (comp_pace / avg_pace) * ref_data['impact'] * usage_boost
                 prob_over = (1 - poisson.cdf(line - 0.5, final_proj)) * 100
 
+                # --- NEW: SUGGESTED BETTING LEGS LOGIC ---
                 st.header(f"{sel_p['full_name']} Analysis")
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Final Projection", round(final_proj, 1), delta=f"{round(usage_boost,2)}x Usage")
@@ -97,6 +97,28 @@ if mode == "Single Player Analysis":
                 c3.metric("L10 Average", round(raw_avg, 1))
                 c4.metric("Win Prob", f"{round(prob_over, 1)}%")
 
+                st.divider()
+                st.subheader("🎯 Sharp Pro Betting Blueprint")
+                b1, b2, b3 = st.columns(3)
+                
+                # Leg 1: The Main Line
+                with b1:
+                    direction = "OVER" if prob_over > 55 else "UNDER"
+                    confidence = "High" if abs(prob_over - 50) > 15 else "Moderate"
+                    st.info(f"**Primary Leg:** {stat_cat} {direction} {line}\n\n**Confidence:** {confidence}")
+                
+                # Leg 2: The Alt-Line (Safety)
+                with b2:
+                    alt_line = line - 4 if direction == "OVER" else line + 4
+                    alt_prob = (1 - poisson.cdf(alt_line - 0.5, final_proj)) * 100 if direction == "OVER" else poisson.cdf(alt_line + 0.5, final_proj) * 100
+                    st.success(f"**Alt-Line Safety:** {stat_cat} {direction} {alt_line}\n\n**Est. Probability:** {round(alt_prob, 1)}%")
+                
+                # Leg 3: The Ladder (Aggressive)
+                with b3:
+                    ladder_line = line + 4 if direction == "OVER" else line - 4
+                    st.warning(f"**Ladder Opportunity:** {stat_cat} {direction} {ladder_line}\n\n**Hit Rate (L10):** {len(log.head(10)[log.head(10)[stat_cat] >= ladder_line if direction == 'OVER' else log.head(10)[stat_cat] <= ladder_line]) * 10}%")
+
+                st.divider()
                 v1, v2 = st.columns(2)
                 with v1:
                     st.subheader("Poisson Probability Curve")
@@ -110,7 +132,7 @@ if mode == "Single Player Analysis":
                     fig_t.add_hline(y=line, line_color="red")
                     st.plotly_chart(fig_t, use_container_width=True)
 
-# --- 4. MODE: TEAM SCANNER (Smart Bet + Injury Boost) ---
+# --- 4. MODE: TEAM SCANNER (Logic Unchanged) ---
 
 elif mode == "Team Scanner":
     st.header("🔍 Value Scanner with Injury Cascading")
@@ -132,7 +154,6 @@ elif mode == "Team Scanner":
                         raw = p_log[stat_cat].head(5).mean()
                         game = schedule.get(sel_team['id'], {'opp': 0, 'ref': "N/A"})
                         
-                        # Apply Cascading Factor (1.12x boost if stars are out)
                         cascade = 1.12 if len(injured_stars) > 0 else 1.0
                         proj = raw * ((pace_map.get(sel_team['id'], 100) + pace_map.get(game['opp'], 100))/200) * cascade
                         prob = (1 - poisson.cdf(line - 0.5, proj)) * 100
