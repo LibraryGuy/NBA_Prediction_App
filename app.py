@@ -12,28 +12,30 @@ from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonpl
 
 # --- 1. NEW: REAL-TIME INJURY SCRAPER ---
 
-@st.cache_data(ttl=1800) # Refreshes every 30 minutes
+@st.cache_data(ttl=1800)
 def get_automated_injury_list():
-    """Scrapes real-time injury data to ensure 100% accuracy."""
     confirmed_out = []
     try:
-        # Scrapes the current injury table
+        # We use requests to get the HTML first, then pass it to pandas
         url = "https://www.cbssports.com/nba/injuries/"
-        tables = pd.read_html(url)
+        header = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=header)
+        
+        # Try different flavors if lxml is missing
+        try:
+            tables = pd.read_html(response.text, flavor='bs4')
+        except ImportError:
+            tables = pd.read_html(response.text, flavor='html5lib')
         
         for table in tables:
-            # We look for 'Out' or 'Expected to be out' in the Status column
             if 'Status' in table.columns and 'Player' in table.columns:
-                # Filter for players explicitly listed as Out
-                out_players = table[table['Status'].str.contains('Out|Targeting|Sidelined', case=False, na=False)]
+                out_players = table[table['Status'].str.contains('Out|Sidelined', case=False, na=False)]
                 confirmed_out.extend(out_players['Player'].tolist())
         
-        # Clean up names (some sites add positions like 'C' or 'PG' to the name)
         confirmed_out = [name.split('  ')[0].strip() for name in confirmed_out]
         
     except Exception as e:
-        st.sidebar.error(f"Scraper Error: {e}")
-        # Fallback list if the scraper fails
+        st.sidebar.warning(f"Injury Sync: Using manual fallback. (Error: {str(e)[:50]}...)")
         confirmed_out = ["Nikola Jokic", "Ja Morant", "Fred VanVleet", "Ty Jerome"]
         
     return list(set(confirmed_out))
