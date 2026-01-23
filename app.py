@@ -8,10 +8,10 @@ import requests
 from datetime import datetime
 from nba_api.stats.endpoints import (playergamelog, leaguegamefinder, 
                                      scoreboardv2, commonplayerinfo, 
-                                     leaguedashteamstats)
+                                     leaguedashteamstats, commonteamroster)
 from nba_api.stats.static import players, teams
 
-# --- 1. DATA ENGINES ---
+# --- 1. THE DATA ENGINE ---
 
 @st.cache_data(ttl=1800)
 def get_live_intelligence():
@@ -56,20 +56,23 @@ def get_matchups_and_refs():
     except:
         return {}
 
-# --- 2. THE DASHBOARD ---
+# --- 2. SETUP & SIDEBAR ---
 
-st.set_page_config(page_title="Sharp Pro v8.7", layout="wide")
+st.set_page_config(page_title="Sharp Pro v8.8", layout="wide")
 intel = get_live_intelligence()
 pace_map, avg_pace = get_pace_context()
 schedule = get_matchups_and_refs()
-team_lookup = {t['id']: t['abbreviation'] for t in teams.get_teams()}
+all_nba_teams = teams.get_teams()
+team_lookup = {t['id']: t['abbreviation'] for t in all_nba_teams}
 
 with st.sidebar:
-    st.title("🏀 Sharp Pro v8.7")
+    st.title("🏀 Sharp Pro v8.8")
     st.success(f"Verified Injuries: {len(intel['injuries'])}")
     mode = st.radio("Navigation", ["Single Player Analysis", "Team Scanner"])
     stat_cat = st.selectbox("Stat", ["PTS", "REB", "AST", "PRA"])
-    line = st.number_input("Sportsbook Line", value=24.5, step=0.5)
+    line = st.number_input("Sportsbook Line", value=22.5, step=0.5)
+
+# --- 3. MODE: SINGLE PLAYER ANALYSIS ---
 
 if mode == "Single Player Analysis":
     search = st.text_input("Player Search", "Shai Gilgeous-Alexander")
@@ -90,39 +93,28 @@ if mode == "Single Player Analysis":
             else:
                 log = playergamelog.PlayerGameLog(player_id=sel_p['id'], season='2025-26').get_data_frames()[0]
                 
-                # --- SAFETY DATA PARSER ---
                 if log.empty:
-                    st.warning(f"No game data found for {sel_p['full_name']} in 2025-26 season.")
+                    st.warning("No data for current season.")
                 else:
-                    if stat_cat == "PRA":
-                        log['PRA'] = log['PTS'] + log['REB'] + log['AST']
+                    if stat_cat == "PRA": log['PRA'] = log['PTS'] + log['REB'] + log['AST']
                     
                     raw_avg = log[stat_cat].head(10).mean()
-                    opp_pace = pace_map.get(game_info['opp'], avg_pace)
-                    composite_pace = (pace_map.get(t_id, avg_pace) + opp_pace) / 2
-                    final_proj = raw_avg * (composite_pace / avg_pace) * ref_data['impact']
+                    pace_factor = ((pace_map.get(t_id, avg_pace) + pace_map.get(game_info['opp'], avg_pace)) / 2) / avg_pace
+                    final_proj = raw_avg * pace_factor * ref_data['impact']
                     prob_over = (1 - poisson.cdf(line - 0.5, final_proj)) * 100
 
-                    # UI: TOP METRICS
                     st.header(f"{sel_p['full_name']} vs {opp_abbr}")
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Final Projection", round(final_proj, 1), delta=f"{round(final_proj-line, 1)} Edge")
-                    c2.metric("Ref Bias", ref_name, delta=ref_data['type'], delta_color="inverse" if ref_data['type'] == "Under" else "normal")
-                    c3.metric("Matchup Pace", round(composite_pace, 1))
+                    c1.metric("Projection", round(final_proj, 1), delta=f"{round(final_proj-line, 1)} Edge")
+                    c2.metric("Ref Bias", ref_name, delta=ref_data['type'])
+                    c3.metric("L10 Average", round(raw_avg, 1))
                     c4.metric("Win Prob", f"{round(prob_over, 1)}%")
 
-                    # SEASON HIGHS/LOWS
                     st.divider()
-                    h1, h2, h3 = st.columns(3)
-                    h1.info(f"🔥 Season High: {log[stat_cat].max()}")
-                    h2.info(f"🧊 Season Low: {log[stat_cat].min()}")
-                    h3.info(f"📊 L10 Volatility: {round(log[stat_cat].head(10).std(), 2)}")
-
-                    # RESTORED GRAPHS
                     v1, v2 = st.columns(2)
                     with v1:
                         st.subheader("Poisson Distribution")
-                        x = np.arange(max(0, int(final_proj-15)), int(final_proj+20))
+                        x = np.arange(max(0, int(final_proj-12)), int(final_proj+15))
                         fig_p = px.bar(x=x, y=poisson.pmf(x, final_proj))
                         fig_p.add_vline(x=line, line_dash="dash", line_color="red")
                         st.plotly_chart(fig_p, use_container_width=True)
@@ -131,11 +123,45 @@ if mode == "Single Player Analysis":
                         fig_t = px.line(log.head(10).iloc[::-1], x='GAME_DATE', y=stat_cat, markers=True)
                         fig_t.add_hline(y=line, line_color="red")
                         st.plotly_chart(fig_t, use_container_width=True)
-                    
-                    # H2H TABLE
-                    st.subheader(f"Historical Matchups vs {opp_abbr}")
-                    h2h = leaguegamefinder.LeagueGameFinder(player_id_nullable=sel_p['id']).get_data_frames()[0]
-                    h2h_df = h2h[h2h['MATCHUP'].str.contains(opp_abbr)].head(5) if opp_abbr != "N/A" else pd.DataFrame()
-                    if not h2h_df.empty:
-                        if stat_cat == "PRA": h2h_df['PRA'] = h2h_df['PTS'] + h2h_df['REB'] + h2h_df['AST']
-                        st.table(h2h_df[['GAME_DATE', 'MATCHUP', 'WL', stat_cat]].reset_index(drop=True))
+
+# --- 4. MODE: TEAM SCANNER (NEWLY ACTIVATED) ---
+
+elif mode == "Team Scanner":
+    st.header("🔍 Professional Team Scanner")
+    selected_team = st.selectbox("Select Team to Scan", all_nba_teams, format_func=lambda x: x['full_name'])
+    
+    if st.button("📡 Scan Roster for Value"):
+        roster = commonteamroster.CommonTeamRoster(team_id=selected_team['id']).get_data_frames()[0]
+        results = []
+        
+        with st.status("Scanning roster through pace and ref models..."):
+            for _, player in roster.iterrows():
+                p_name = player['PLAYER']
+                p_id = player['PLAYER_ID']
+                
+                if p_name in intel['injuries']:
+                    continue
+                
+                try:
+                    # Quick L5 analysis for speed
+                    log = playergamelog.PlayerGameLog(player_id=p_id, season='2025-26').get_data_frames()[0]
+                    if not log.empty:
+                        if stat_cat == "PRA": log['PRA'] = log['PTS'] + log['REB'] + log['AST']
+                        
+                        raw_avg = log[stat_cat].head(5).mean()
+                        game_info = schedule.get(selected_team['id'], {'opp': None, 'ref': "Unknown"})
+                        ref_data = intel['ref_bias'].get(game_info['ref'], {"impact": 1.0})
+                        
+                        # Apply Pace & Ref logic
+                        proj = raw_avg * ((pace_map.get(selected_team['id'], 100) + pace_map.get(game_info['opp'], 100))/200) * ref_data['impact']
+                        edge = proj - line
+                        
+                        results.append({"Player": p_name, "Proj": round(proj, 1), "Edge": round(edge, 1), "L5 Avg": round(raw_avg, 1)})
+                except:
+                    continue
+        
+        if results:
+            res_df = pd.DataFrame(results).sort_values(by="Edge", ascending=False)
+            st.dataframe(res_df.style.background_gradient(subset=['Edge'], cmap='RdYlGn'), use_container_width=True)
+        else:
+            st.info("No active players with recent data found for this team.")
