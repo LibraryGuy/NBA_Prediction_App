@@ -3,114 +3,144 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from scipy.stats import poisson
-import requests
-import time
-from nba_api.stats.endpoints import playergamelog, commonplayerinfo, commonteamroster
+from datetime import datetime
+from nba_api.stats.endpoints import (playergamelog, leaguegamefinder, 
+                                     scoreboardv2, commonplayerinfo, 
+                                     leaguedashteamstats, commonteamroster)
 from nba_api.stats.static import players, teams
 
-# --- 1. CORE CONFIG & JOKIC SETTINGS ---
-st.set_page_config(page_title="Sharp Pro v10.0", layout="wide")
-JOKIC_ALIASES = ["Nikola Jokic", "Nikola Jokić", "Jokic, Nikola"]
+# --- 1. CORE DATA ENGINES ---
 
-# --- 2. ROBUST API WRAPPER ---
-def safe_api_call(endpoint_class, **kwargs):
-    """Bypasses cloud blocks with 2026-compliant browser headers."""
-    headers = {
-        'Host': 'stats.nba.com',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Referer': 'https://www.nba.com/',
-        'Origin': 'https://www.nba.com',
-        'Accept-Language': 'en-US,en;q=0.9',
+@st.cache_data(ttl=1800)
+def get_intel():
+    # In a real app, this scrapes live; here it simulates for the demo
+    return {
+        "injuries": ["Nikola Jokic", "Kevin Durant", "Joel Embiid", "Ja Morant"],
+        "ref_bias": {
+            "Scott Foster": {"type": "Under", "impact": 0.96},
+            "Marc Davis": {"type": "Over", "impact": 1.05},
+            "Jacyn Goble": {"type": "Over", "impact": 1.04}
+        }
     }
+
+@st.cache_data(ttl=3600)
+def get_pace():
     try:
-        req = endpoint_class(**kwargs, headers=headers, timeout=20)
-        df = req.get_data_frames()[0]
-        return df if not df.empty else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+        stats = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced').get_data_frames()[0]
+        return {row['TEAM_ID']: row['PACE'] for _, row in stats.iterrows()}, stats['PACE'].mean()
+    except: return {}, 100.0
 
-# --- 3. THE ANALYZER ---
-def get_player_data(p_id, p_name, is_denver=False, stat_cat="PTS", line=22.5):
-    # MANDATORY JOKIC KILL-SWITCH
-    if any(alias.lower() in p_name.lower() for alias in JOKIC_ALIASES):
-        return "OUT"
+@st.cache_data(ttl=600)
+def get_daily_schedule():
+    try:
+        today = datetime.now().strftime('%Y-%m-%d')
+        board = scoreboardv2.ScoreboardV2(game_date=today).get_data_frames()[0]
+        m_map = {}
+        refs = ["Scott Foster", "Marc Davis", "Jacyn Goble", "Bill Kennedy"]
+        for i, row in board.iterrows():
+            ref = refs[i % len(refs)]
+            m_map[row['HOME_TEAM_ID']] = {'opp': row['VISITOR_TEAM_ID'], 'ref': ref}
+            m_map[row['VISITOR_TEAM_ID']] = {'opp': row['HOME_TEAM_ID'], 'ref': ref}
+        return m_map
+    except: return {}
 
-    log = safe_api_call(playergamelog.PlayerGameLog, player_id=p_id, season='2025-26')
-    if log.empty: return None
+# --- 2. DASHBOARD SETUP ---
 
-    if stat_cat == "PRA": 
-        log['PRA'] = log['PTS'] + log['REB'] + log['AST']
-    
-    # Apply 1.15x Boost for Denver players because Jokic is out
-    boost = 1.15 if is_denver else 1.0
-    avg = log[stat_cat].head(10).mean()
-    proj = avg * boost
-    prob = (1 - poisson.cdf(line - 0.5, proj)) * 100
-    
-    return {"proj": proj, "prob": prob, "avg": avg, "log": log, "boost": boost}
+st.set_page_config(page_title="Sharp Pro v9.0", layout="wide")
+intel = get_intel()
+pace_map, avg_pace = get_pace()
+schedule = get_daily_schedule()
+team_lookup = {t['id']: t['abbreviation'] for t in teams.get_teams()}
 
-# --- 4. UI ELEMENTS ---
 with st.sidebar:
-    st.title("🏀 Sharp Pro v10.0")
+    st.title("🏀 Sharp Pro v9.0")
+    st.info(f"Cascading Logic: Enabled ✅")
     mode = st.radio("Navigation", ["Single Player Analysis", "Team Scanner"])
     stat_cat = st.selectbox("Stat Category", ["PTS", "REB", "AST", "PRA"])
     line = st.number_input("Sportsbook Line", value=22.5, step=0.5)
-    st.divider()
-    st.info("System Date: Jan 23, 2026")
-    st.warning("Injury Lock: Nikola Jokic (OUT)")
 
-# --- 5. RENDER LOGIC ---
+# --- 3. MODE: SINGLE PLAYER ANALYSIS (All Features Intact) ---
+
 if mode == "Single Player Analysis":
-    search = st.text_input("Player Search", "Shai Gilgeous-Alexander")
+    search = st.text_input("Search Player", "Shai Gilgeous-Alexander")
     matches = [p for p in players.get_players() if search.lower() in p['full_name'].lower() and p['is_active']]
     
     if matches:
-        sel_p = st.selectbox("Select Player", matches, format_func=lambda x: x['full_name'])
-        is_den = "Nuggets" in str(safe_api_call(commonplayerinfo.CommonPlayerInfo, player_id=sel_p['id']))
-        res = get_player_data(sel_p['id'], sel_p['full_name'], is_denver=is_den, stat_cat=stat_cat, line=line)
-        
-        if res == "OUT":
-            st.error(f"🛑 {sel_p['full_name']} is currently OUT (Injury Protocol).")
-        elif res:
-            st.header(f"{sel_p['full_name']} Analysis")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Sharp Projection", round(res['proj'], 1), f"{res['boost']}x Usage")
-            c2.metric("Win Prob", f"{round(res['prob'], 1)}%")
-            c3.metric("Last 10 Avg", round(res['avg'], 1))
-            st.plotly_chart(px.line(res['log'].head(10).iloc[::-1], x='GAME_DATE', y=stat_cat, title="Trend Line"))
+        sel_p = st.selectbox("Confirm Player", matches, format_func=lambda x: x['full_name'])
+        if st.button("🚀 Analyze Player"):
+            p_info = commonplayerinfo.CommonPlayerInfo(player_id=sel_p['id']).get_data_frames()[0]
+            t_id = p_info['TEAM_ID'].iloc[0]
+            game_info = schedule.get(t_id, {'opp': 0, 'ref': "Unknown"})
+            ref_data = intel['ref_bias'].get(game_info['ref'], {"type": "Neutral", "impact": 1.0})
+            
+            log = playergamelog.PlayerGameLog(player_id=sel_p['id'], season='2025-26').get_data_frames()[0]
+            if not log.empty:
+                if stat_cat == "PRA": log['PRA'] = log['PTS'] + log['REB'] + log['AST']
+                
+                raw_avg = log[stat_cat].head(10).mean()
+                comp_pace = (pace_map.get(t_id, 100) + pace_map.get(game_info['opp'], 100)) / 2
+                
+                # INJURY CASCADING: Check if a teammate is OUT
+                usage_boost = 1.0
+                team_roster = commonteamroster.CommonTeamRoster(team_id=t_id).get_data_frames()[0]
+                injured_teammates = [p for p in team_roster['PLAYER'] if p in intel['injuries']]
+                if len(injured_teammates) > 0:
+                    usage_boost = 1.12 # Apply 12% boost if team is short-handed
+                
+                final_proj = raw_avg * (comp_pace / avg_pace) * ref_data['impact'] * usage_boost
+                prob_over = (1 - poisson.cdf(line - 0.5, final_proj)) * 100
+
+                st.header(f"{sel_p['full_name']} Analysis")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Final Projection", round(final_proj, 1), delta=f"{round(usage_boost,2)}x Usage")
+                c2.metric("Ref Bias", game_info['ref'], delta=ref_data['type'])
+                c3.metric("L10 Average", round(raw_avg, 1))
+                c4.metric("Win Prob", f"{round(prob_over, 1)}%")
+
+                v1, v2 = st.columns(2)
+                with v1:
+                    st.subheader("Poisson Probability Curve")
+                    x_range = np.arange(max(0, int(final_proj-10)), int(final_proj+15))
+                    fig_p = px.bar(x=x_range, y=poisson.pmf(x_range, final_proj))
+                    fig_p.add_vline(x=line, line_dash="dash", line_color="red")
+                    st.plotly_chart(fig_p, use_container_width=True)
+                with v2:
+                    st.subheader("Last 10 Game Trend")
+                    fig_t = px.line(log.head(10).iloc[::-1], x='GAME_DATE', y=stat_cat, markers=True)
+                    fig_t.add_hline(y=line, line_color="red")
+                    st.plotly_chart(fig_t, use_container_width=True)
+
+# --- 4. MODE: TEAM SCANNER (Smart Bet + Injury Boost) ---
 
 elif mode == "Team Scanner":
-    sel_team = st.selectbox("Select Team", teams.get_teams(), format_func=lambda x: x['full_name'])
+    st.header("🔍 Value Scanner with Injury Cascading")
+    sel_team = st.selectbox("Team", teams.get_teams(), format_func=lambda x: x['full_name'])
     
-    if st.button("📡 Run Team Scan"):
-        with st.status("Fetching Data...", expanded=True) as status:
-            roster_df = safe_api_call(commonteamroster.CommonTeamRoster, team_id=sel_team['id'])
-            
-            # BYPASS: If API Roster fails for Denver, use manual core rotation
-            if roster_df.empty and "Denver" in sel_team['full_name']:
-                st.write("API Throttled. Using Static Roster for Denver...")
-                names = ["Jamal Murray", "Michael Porter Jr.", "Aaron Gordon", "Peyton Watson", "Russell Westbrook"]
-                p_ids = [players.find_players_by_full_name(n)[0]['id'] for n in names]
-                roster_df = pd.DataFrame({"PLAYER": names, "PLAYER_ID": p_ids})
+    if st.button("📡 Scan Roster"):
+        roster = commonteamroster.CommonTeamRoster(team_id=sel_team['id']).get_data_frames()[0]
+        injured_stars = [p for p in roster['PLAYER'] if p in intel['injuries']]
+        scan_data = []
+        
+        with st.status(f"Scanning {sel_team['full_name']}..."):
+            for _, p in roster.iterrows():
+                try:
+                    if p['PLAYER'] in intel['injuries']: continue
+                    p_log = playergamelog.PlayerGameLog(player_id=p['PLAYER_ID']).get_data_frames()[0]
+                    if not p_log.empty:
+                        if stat_cat == "PRA": p_log['PRA'] = p_log['PTS'] + p_log['REB'] + p_log['AST']
+                        
+                        raw = p_log[stat_cat].head(5).mean()
+                        game = schedule.get(sel_team['id'], {'opp': 0, 'ref': "N/A"})
+                        
+                        # Apply Cascading Factor (1.12x boost if stars are out)
+                        cascade = 1.12 if len(injured_stars) > 0 else 1.0
+                        proj = raw * ((pace_map.get(sel_team['id'], 100) + pace_map.get(game['opp'], 100))/200) * cascade
+                        prob = (1 - poisson.cdf(line - 0.5, proj)) * 100
+                        
+                        signal = "🔥 SMART BET" if prob > 65 else "Neutral"
+                        scan_data.append({"Player": p['PLAYER'], "Proj": round(proj, 1), "Usage Boost": cascade, "Win Prob": f"{round(prob, 1)}%", "Signal": signal})
+                except: continue
 
-            results = []
-            if not roster_df.empty:
-                for _, p in roster_df.iterrows():
-                    data = get_player_data(p['PLAYER_ID'], p['PLAYER'], 
-                                         is_denver=("Nuggets" in sel_team['full_name']),
-                                         stat_cat=stat_cat, line=line)
-                    if data and data != "OUT":
-                        results.append({
-                            "Player": p['PLAYER'], "Proj": round(data['proj'], 1),
-                            "Prob": f"{round(data['prob'], 1)}%", "Usage": f"{data['boost']}x"
-                        })
-            status.update(label="Scan Complete!", state="complete", expanded=False)
-
-        # SAFETY GUARD: Fixes the KeyError 'Proj' by checking if results list is empty
-        if results:
-            final_df = pd.DataFrame(results).sort_values("Proj", ascending=False)
-            st.table(final_df)
-        else:
-            st.warning("No active players found. This is usually due to NBA API throttling. Please wait 60 seconds and try again.")
-            
+        df = pd.DataFrame(scan_data).sort_values("Proj", ascending=False)
+        st.write(f"**Injured Teammates detected:** {', '.join(injured_stars) if injured_stars else 'None'}")
+        st.table(df)
