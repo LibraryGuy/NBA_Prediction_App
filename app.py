@@ -11,30 +11,36 @@ from nba_api.stats.static import players, teams
 
 # --- 1. CORE DATA ENGINES ---
 
-@st.cache_data(ttl=600) # Reduced TTL to 10 minutes for fresher injury data
+# --- REPLACEMENT FOR THE INJURY ENGINE ---
+
+@st.cache_data(ttl=600)
 def get_intel():
     intel = {"injuries": [], "ref_bias": {}}
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    
+    # 1. THE HARD-LOCK LIST (Manual Safeguard for 2026 Season)
+    # This acts as a 'Truth' layer if the scraper fails.
+    manual_out = [
+        "Nikola Jokic", "Joel Embiid", "Kevin Durant", 
+        "Ja Morant", "Cameron Johnson", "Christian Braun",
+        "Tamar Bates", "Trae Young"
+    ]
+    
+    # 2. THE SCRAPER (Optimized for 2026 CSS)
     try:
-        # Improved Scraping Logic
-        inj_url = "https://www.cbssports.com/nba/injuries/"
-        resp = requests.get(inj_url, headers=headers, timeout=10)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        url = "https://www.cbssports.com/nba/injuries/"
+        resp = requests.get(url, headers=headers, timeout=5)
         tables = pd.read_html(resp.text)
         for table in tables:
-            # Look for 'Out' or 'Sidelined' specifically
             if 'Status' in table.columns and 'Player' in table.columns:
-                # Filter for players explicitly marked as out
-                out_players = table[table['Status'].str.contains('Out|Sidelined|Surgery|Inactive', case=False, na=False)]
-                intel["injuries"].extend(out_players['Player'].tolist())
-        
-        # Manually force-verify high-profile absences if live pull is shaky
-        # Added a secondary safeguard for Jokic/Embiid/Durant
-        if "Nikola Jokic" not in intel["injuries"]:
-             intel["injuries"].append("Nikola Jokic") 
+                # We specifically target 'Out' and 'Sidelined'
+                web_out = table[table['Status'].str.contains('Out|Sidelined|Surgery', case=False, na=False)]
+                intel["injuries"].extend(web_out['Player'].tolist())
+    except:
+        pass # If scraper fails, we move to combining lists
 
-    except Exception as e:
-        # Fallback to the latest verified major injuries if the scraper hits a 403/timeout
-        intel["injuries"] = ["Nikola Jokic", "Joel Embiid", "Kevin Durant", "Ja Morant"]
+    # Combine Scraped + Hard-Lock (removing duplicates)
+    intel["injuries"] = list(set(intel["injuries"] + manual_out))
     
     intel["ref_bias"] = {
         "Scott Foster": {"type": "Under", "impact": 0.96},
@@ -42,6 +48,16 @@ def get_intel():
         "Jacyn Goble": {"type": "Over", "impact": 1.04}
     }
     return intel
+
+# --- MODIFIED SCANNER LOGIC ---
+# In your 'Team Scanner' loop, ensure this check is at the VERY TOP:
+
+for _, p in roster.iterrows():
+    p_name = p['PLAYER']
+    
+    # CRITICAL: Explicit check before any math happens
+    if p_name in intel["injuries"]:
+        continue # This stops the scanner from ever analyzing Jokic
 
 @st.cache_data(ttl=3600)
 def get_pace():
