@@ -1,7 +1,6 @@
+nba_api
 streamlit
 pandas
-numpy
-plotly
-nba_api
-scipy
-matplotlib
+lxml
+beautifulsoup4
+html5lib
