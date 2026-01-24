@@ -10,6 +10,20 @@ from nba_api.stats.endpoints import (playergamelog, leaguegamefinder,
                                      leaguedashteamstats, commonteamroster)
 from nba_api.stats.static import players, teams
 
+# --- NEW: NBA.COM BROWSER EMULATION HEADERS ---
+# This helps prevent cloud-hosting blocks
+HEADERS = {
+    'Host': 'stats.nba.com',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:72.0) Gecko/20100101 Firefox/72.0',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'X-NewRelic-ID': 'VQECWF5UChAZV1BRBAMUCX0=',
+    'Origin': 'https://www.nba.com',
+    'Referer': 'https://www.nba.com/',
+    'Connection': 'keep-alive',
+}
+
 # --- 1. CORE DATA ENGINES ---
 
 @st.cache_data(ttl=1800)
@@ -26,7 +40,13 @@ def get_intel():
 @st.cache_data(ttl=3600)
 def get_pace():
     try:
-        stats = leaguedashteamstats.LeagueDashTeamStats(measure_type_detailed_defense='Advanced').get_data_frames()[0]
+        # Pass headers and timeout to every endpoint call
+        stats_call = leaguedashteamstats.LeagueDashTeamStats(
+            measure_type_detailed_defense='Advanced',
+            headers=HEADERS,
+            timeout=60
+        )
+        stats = stats_call.get_data_frames()[0]
         return {row['TEAM_ID']: row['PACE'] for _, row in stats.iterrows()}, stats['PACE'].mean()
     except: return {}, 100.0
 
@@ -35,7 +55,7 @@ def get_daily_schedule():
     try:
         tz = pytz.timezone('US/Eastern')
         today = datetime.now(tz).strftime('%Y-%m-%d')
-        board = scoreboardv2.ScoreboardV2(game_date=today).get_data_frames()[0]
+        board = scoreboardv2.ScoreboardV2(game_date=today, headers=HEADERS, timeout=60).get_data_frames()[0]
         m_map = {}
         refs = ["Scott Foster", "Marc Davis", "Jacyn Goble", "Bill Kennedy"]
         for i, row in board.iterrows():
@@ -70,16 +90,28 @@ if mode == "Single Player Analysis":
         sel_p = st.selectbox("Confirm Player", matches, format_func=lambda x: x['full_name'])
         if st.button("🚀 Run Full Analysis"):
             # A. Context Setup
-            p_info = commonplayerinfo.CommonPlayerInfo(player_id=sel_p['id']).get_data_frames()[0]
+            p_info = commonplayerinfo.CommonPlayerInfo(player_id=sel_p['id'], headers=HEADERS, timeout=60).get_data_frames()[0]
             t_id = p_info['TEAM_ID'].iloc[0]
             game_context = schedule.get(t_id, {'opp_id': 0, 'ref': "Unknown"})
             opp_id = game_context['opp_id']
             opp_name = team_lookup.get(opp_id, "Opponent")
             ref_data = intel['ref_bias'].get(game_context['ref'], {"type": "Neutral", "impact": 1.0})
             
-            # B. Data Fetching
-            log = playergamelog.PlayerGameLog(player_id=sel_p['id'], season='2025-26').get_data_frames()[0]
-            h2h = leaguegamefinder.LeagueGameFinder(player_id_nullable=sel_p['id'], vs_team_id_nullable=opp_id).get_data_frames()[0]
+            # B. Data Fetching with Timeout Handling
+            log = playergamelog.PlayerGameLog(player_id=sel_p['id'], season='2025-26', headers=HEADERS, timeout=60).get_data_frames()[0]
+            
+            # --- PROTECTED H2H CALL ---
+            h2h = pd.DataFrame()
+            try:
+                h2h_call = leaguegamefinder.LeagueGameFinder(
+                    player_id_nullable=sel_p['id'], 
+                    vs_team_id_nullable=opp_id,
+                    headers=HEADERS,
+                    timeout=30 # Lower timeout here so it fails fast if blocked
+                )
+                h2h = h2h_call.get_data_frames()[0]
+            except Exception as e:
+                st.warning("⚠️ H2H Data currently unavailable due to NBA.com throttling. Showing season trends only.")
             
             if not log.empty:
                 # Stat processing
@@ -90,7 +122,7 @@ if mode == "Single Player Analysis":
                 # Projection Logic
                 raw_avg = log[stat_cat].head(10).mean()
                 comp_pace = (pace_map.get(t_id, 100) + pace_map.get(opp_id, 100)) / 2
-                usage_boost = 1.12 if any(p in intel['injuries'] for p in commonteamroster.CommonTeamRoster(team_id=t_id).get_data_frames()[0]['PLAYER']) else 1.0
+                usage_boost = 1.12 if any(p in intel['injuries'] for p in commonteamroster.CommonTeamRoster(team_id=t_id, headers=HEADERS, timeout=60).get_data_frames()[0]['PLAYER']) else 1.0
                 
                 final_proj = raw_avg * (comp_pace / avg_pace) * ref_data['impact'] * usage_boost
                 prob_over = (1 - poisson.cdf(line - 0.5, final_proj)) * 100
@@ -122,7 +154,7 @@ if mode == "Single Player Analysis":
                     h2h_display['Result vs Line'] = h2h_display[stat_cat].apply(lambda x: "✅ Over" if x > line else "❌ Under")
                     st.table(h2h_display)
                 else:
-                    st.info(f"No historical head-to-head data found for {sel_p['full_name']} vs {opp_name}.")
+                    st.info(f"Historical H2H data limited for {sel_p['full_name']} vs {opp_name}.")
 
                 # --- UI: SECTION 4 - VISUALIZATIONS ---
                 st.divider()
@@ -139,13 +171,13 @@ if mode == "Single Player Analysis":
                     fig_t.add_hline(y=line, line_color="red", line_dash="dash")
                     st.plotly_chart(fig_t, use_container_width=True)
 
-# --- 4. MODE: TEAM SCANNER (RETAINED) ---
+# --- 4. MODE: TEAM SCANNER ---
 elif mode == "Team Scanner":
     st.header("🔍 Value Scanner with Injury Cascading")
     sel_team = st.selectbox("Select Team to Scan", teams.get_teams(), format_func=lambda x: x['full_name'])
     
     if st.button("📡 Scan Roster for Value"):
-        roster = commonteamroster.CommonTeamRoster(team_id=sel_team['id']).get_data_frames()[0]
+        roster = commonteamroster.CommonTeamRoster(team_id=sel_team['id'], headers=HEADERS, timeout=60).get_data_frames()[0]
         injured_stars = [p for p in roster['PLAYER'] if p in intel['injuries']]
         scan_data = []
         
@@ -153,7 +185,7 @@ elif mode == "Team Scanner":
             for _, p in roster.iterrows():
                 try:
                     if p['PLAYER'] in intel['injuries']: continue
-                    p_log = playergamelog.PlayerGameLog(player_id=p['PLAYER_ID']).get_data_frames()[0]
+                    p_log = playergamelog.PlayerGameLog(player_id=p['PLAYER_ID'], headers=HEADERS, timeout=60).get_data_frames()[0]
                     if not p_log.empty:
                         if stat_cat == "PRA": p_log['PRA'] = p_log['PTS'] + p_log['REB'] + p_log['AST']
                         raw = p_log[stat_cat].head(5).mean()
@@ -161,6 +193,6 @@ elif mode == "Team Scanner":
                         cascade = 1.12 if len(injured_stars) > 0 else 1.0
                         proj = raw * ((pace_map.get(sel_team['id'], 100) + pace_map.get(game['opp_id'], 100))/200) * cascade
                         prob = (1 - poisson.cdf(line - 0.5, proj)) * 100
-                        scan_data.append({"Player": p['PLAYER'], "L5 Avg": round(raw, 1), "Proj": round(proj, 1), "Win Prob": f"{round(prob, 1)}%", "Signal": "🔥 OVER" if prob > 65 else ("❄️ UNDER" if prob < 35 else "Neutral")})
+                        scan_data.append({"Player": p['PLAYER'], "L5 Avg": round(raw, 1), "Win Prob": f"{round(prob, 1)}%", "Signal": "🔥 OVER" if prob > 65 else ("❄️ UNDER" if prob < 35 else "Neutral")})
                 except: continue
-        st.dataframe(pd.DataFrame(scan_data).sort_values("Proj", ascending=False), use_container_width=True)
+        st.dataframe(pd.DataFrame(scan_data), use_container_width=True)
