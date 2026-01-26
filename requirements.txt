@@ -1,6 +1,6 @@
-streamlit
-pandas
-numpy
-plotly
-scipy
+streamlit>=1.28.0
+st-gsheets-connection
 nba_api
+pandas
+scipy
+plotly
