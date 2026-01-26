@@ -1,6 +1,9 @@
-streamlit>=1.28.0
-st-gsheets-connection
-nba_api
+streamlit>=1.32.0
 pandas
-scipy
+numpy
 plotly
+scipy
+nba_api
+requests
+GitPython
+st-gsheets-connection
