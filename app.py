@@ -1,105 +1,152 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
 from scipy.stats import poisson
 import time
 import random
 import uuid
+import unicodedata
 from streamlit_gsheets import GSheetsConnection
-from nba_api.stats.endpoints import playergamelog, commonplayerinfo
-from nba_api.stats.static import players
+from nba_api.stats.endpoints import (playergamelog, commonplayerinfo, 
+                                     leaguedashteamstats, commonteamroster,
+                                     leaguegamefinder)
+from nba_api.stats.static import players, teams
 
-# --- 1. STEALTH & IDENTITY GENERATOR ---
+# --- 1. UTILITIES & STEALTH ---
+def normalize_string(text):
+    """Removes accents and converts to lowercase for matching (e.g., Dončić -> doncic)."""
+    return "".join(
+        c for c in unicodedata.normalize('NFD', text.lower())
+        if unicodedata.category(c) != 'Mn'
+    )
+
 def get_stealth_headers():
-    """Generates a unique digital fingerprint for every single request."""
+    """Generates unique IDs and random browsers to avoid bot detection."""
     user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0 Safari/537.36"
     ]
-    
-    # This generates a 'New ID' for the NBA API to see
-    random_token = str(uuid.uuid4()) # Unique ID per request
-    
     return {
         'Host': 'stats.nba.com',
-        'Connection': 'keep-alive',
         'User-Agent': random.choice(user_agents),
         'x-nba-stats-origin': 'stats',
         'x-nba-stats-token': 'true',
-        'x-nba-stats-request-id': random_token, # Custom unique ID
-        'Referer': f'https://www.nba.com/player/{random.randint(100, 10000)}',
+        'x-nba-stats-request-id': str(uuid.uuid4()),
+        'Referer': 'https://www.nba.com/',
         'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
     }
 
-# --- 2. DATA ENGINES (API + SHEETS) ---
-def fetch_player_stats(player_id, stat_cat):
-    """Try Live API with stealth, fallback to Google Sheets if blocked."""
-    
-    # 1. Try Live API with Stealth Headers
+# --- 2. DATA ENGINES ---
+@st.cache_data(ttl=3600)
+def get_pace_data():
     try:
-        headers = get_stealth_headers()
-        log = playergamelog.PlayerGameLog(
-            player_id=player_id, 
-            season='2025-26', 
-            headers=headers, 
+        df = leaguedashteamstats.LeagueDashTeamStats(
+            measure_type_detailed_defense='Advanced', 
+            headers=get_stealth_headers(),
             timeout=15
         ).get_data_frames()[0]
-        
-        if not log.empty:
-            st.sidebar.success("🟢 Live Data Active")
-            return log, "Live"
-    except Exception:
-        st.sidebar.warning("🟡 NBA Blocked API. Switching to Sheets...")
+        return {row['TEAM_ID']: row['PACE'] for _, row in df.iterrows()}, df['PACE'].mean()
+    except:
+        return {t['id']: 100.0 for t in teams.get_teams()}, 100.0
 
-    # 2. Fallback to Google Sheets
-    try:
-        conn = st.connection("gsheets", type=GSheetsConnection)
-        # Replace the URL below with your actual Google Sheet URL
-        df = conn.read(spreadsheet=st.secrets["connections"]["gsheets"]["spreadsheet"], ttl="1h")
-        player_data = df[df['PLAYER_ID'] == player_id]
-        
-        if not player_data.empty:
-            return player_data, "Cached (Sheets)"
-    except Exception as e:
-        st.sidebar.error("🔴 All Data Sources Failed")
-        return pd.DataFrame(), "Failed"
+# --- 3. FULL SIDEBAR RESTORATION ---
+st.set_page_config(page_title="Sharp Pro v11.5", layout="wide")
 
-# --- 3. DASHBOARD UI ---
-st.set_page_config(page_title="Sharp Pro v11.0", layout="wide")
-
-# Sidebar Configuration
 with st.sidebar:
-    st.title("🏀 Sharp Pro v11.0")
-    st.info("Bypass: UUID Fingerprinting 🛡️")
-    stat_cat = st.selectbox("Stat Category", ["PTS", "REB", "AST"])
-    line = st.number_input("Sportsbook Line", value=15.5)
-
-# Player Search
-search = st.text_input("Search Player", "Nikola Jokic")
-matches = [p for p in players.get_players() if search.lower() in p['full_name'].lower() and p['is_active']]
-
-if matches:
-    sel_p = st.selectbox("Confirm Player", matches, format_func=lambda x: x['full_name'])
+    st.title("🏀 Sharp Pro v11.5")
+    st.markdown("---")
     
-    if st.button("🚀 Run Analysis"):
-        with st.spinner("Rotating Headers & Fetching..."):
-            data, source = fetch_player_stats(sel_p['id'], stat_cat)
+    # Navigation Mode
+    mode = st.radio("Dashboard Navigation", ["Single Player Analysis", "Team Scanner"])
+    
+    st.markdown("---")
+    # Betting Parameters
+    stat_cat = st.selectbox("Stat Category", ["PTS", "REB", "AST", "PRA"])
+    line = st.number_input("Sportsbook Line", value=22.5, step=0.5)
+    
+    st.markdown("---")
+    # Connection Settings
+    st.subheader("System Status")
+    use_backup = st.toggle("Enable G-Sheets Fallback", value=False)
+    st.info("Bypass: UUID Fingerprinting ✅")
+
+pace_map, avg_pace = get_pace_data()
+intel = {"injuries": ["Nikola Jokic", "Kevin Durant", "Joel Embiid"], "ref_bias": {}}
+
+# --- 4. MODE: SINGLE PLAYER ANALYSIS ---
+if mode == "Single Player Analysis":
+    st.header("👤 Player Matchup Engine")
+    
+    # STEP 1: Text Search (Accent Insensitive)
+    search_query = st.text_input("1. Search Player Name (e.g., 'Doncic' or 'Jokic')", "Luka")
+    
+    # Filter players using normalized names
+    norm_query = normalize_string(search_query)
+    all_players = players.get_players()
+    matches = [
+        p for p in all_players 
+        if norm_query in normalize_string(p['full_name']) and p['is_active']
+    ]
+    
+    # STEP 2: Selection Box
+    if matches:
+        sel_p = st.selectbox("2. Confirm Selection", matches, format_func=lambda x: x['full_name'])
+        
+        if st.button("🚀 Run Full Analysis"):
+            with st.spinner(f"Fetching data for {sel_p['full_name']}..."):
+                try:
+                    # Fetching Data
+                    time.sleep(random.uniform(0.5, 1.2)) # Random delay for stealth
+                    log = playergamelog.PlayerGameLog(
+                        player_id=sel_p['id'], 
+                        season='2025-26', 
+                        headers=get_stealth_headers(), 
+                        timeout=20
+                    ).get_data_frames()[0]
+                    
+                    if not log.empty:
+                        if stat_cat == "PRA": 
+                            log['PRA'] = log['PTS'] + log['REB'] + log['AST']
+                        
+                        raw_avg = log[stat_cat].head(10).mean()
+                        final_proj = raw_avg * (1.0) # Simplified for example
+                        prob_over = (1 - poisson.cdf(line - 0.5, final_proj)) * 100
+
+                        # UI Display
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("10-Game Avg", round(raw_avg, 1))
+                        c2.metric("Projected", round(final_proj, 1))
+                        c3.metric("Over Prob", f"{round(prob_over, 1)}%")
+                        
+                        st.subheader("Recent Performance Trend")
+                        fig = px.line(log.head(10).iloc[::-1], x='GAME_DATE', y=stat_cat, markers=True)
+                        fig.add_hline(y=line, line_color="red", line_dash="dash")
+                        st.plotly_chart(fig, use_container_width=True)
+                except Exception as e:
+                    st.error(f"API Error. Try re-running or wait 30 seconds.")
+
+# --- 5. MODE: TEAM SCANNER ---
+elif mode == "Team Scanner":
+    st.header("🔍 Full Roster Value Scanner")
+    sel_team = st.selectbox("Select Team", teams.get_teams(), format_func=lambda x: x['full_name'])
+    
+    if st.button("📡 Scan Roster"):
+        try:
+            roster = commonteamroster.CommonTeamRoster(team_id=sel_team['id'], timeout=20).get_data_frames()[0]
+            scan_results = []
             
-            if not data.empty:
-                avg_val = data[stat_cat].head(10).mean()
-                prob_over = (1 - poisson.cdf(line - 0.5, avg_val)) * 100
-                
-                # Main Display
-                st.header(f"{sel_p['full_name']} Analysis")
-                st.caption(f"Data Source: {source}")
-                
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Projected", round(avg_val, 1))
-                m2.metric("Over Probability", f"{round(prob_over, 1)}%")
-                m3.metric("Request ID", get_stealth_headers()['x-nba-stats-request-id'][:8])
-                
-                st.dataframe(data.head(10))
-            else:
-                st.error("Could not retrieve data for this player.")
+            with st.status("Scanning roster via stealth tunnel...") as status:
+                for i, p in roster.head(8).iterrows(): # Scans top 8 to stay safe
+                    status.update(label=f"Analyzing {p['PLAYER']}...")
+                    time.sleep(1.0)
+                    try:
+                        p_log = playergamelog.PlayerGameLog(player_id=p['PLAYER_ID'], timeout=15, headers=get_stealth_headers()).get_data_frames()[0]
+                        if not p_log.empty:
+                            avg = p_log['PTS'].head(5).mean() # Defaulting to PTS for scan
+                            scan_results.append({"Player": p['PLAYER'], "Avg PTS": round(avg, 1)})
+                    except: continue
+            
+            st.table(pd.DataFrame(scan_results))
+        except:
+            st.error("Scanner Timed Out.")
