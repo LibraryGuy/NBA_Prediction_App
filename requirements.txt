@@ -1,6 +1,6 @@
-nba_api
-streamlit
-pandas
-lxml
-beautifulsoup4
-html5lib
+streamlit==1.31.0
+pandas==2.2.0
+numpy==1.26.4
+plotly==5.18.0
+scipy==1.12.0
+nba_api==1.4.1
