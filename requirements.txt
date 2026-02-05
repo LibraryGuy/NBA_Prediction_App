@@ -1,10 +1,6 @@
-streamlit>=1.32.0
+streamlit
 pandas
 numpy
 plotly
 scipy
-nba_api
-requests
-GitPython
-st-gsheets-connection
-datetime
+balldontlie
