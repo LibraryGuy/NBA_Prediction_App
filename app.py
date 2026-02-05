@@ -9,7 +9,7 @@ from balldontlie import BalldontlieAPI
 
 # --- 1. INITIALIZATION ---
 # Replace with your actual API key from balldontlie.io
-BDL_API_KEY = "YOUR_FREE_API_KEY_HERE"
+BDL_API_KEY = "ea294f0e-31cd-4b1b-aedb-e8fd246b907f"
 api = BalldontlieAPI(api_key=BDL_API_KEY)
 
 # --- 2. DATA ENGINES (Balldontlie Refactor) ---
