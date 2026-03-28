@@ -78,63 +78,98 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# --- 4. SINGLE PLAYER ANALYSIS ---
-
+# --- 4. SINGLE PLAYER ANALYSIS (REVISED) ---
 if mode == "Single Player":
     st.header("👤 Player Analyst")
-    c1, c2 = st.columns(2)
-    with c1:
-        search_q = st.text_input("Search Name", "Luka Doncic")
+    search_q = st.text_input("Search Name (e.g., 'LeBron')", "Luka Doncic")
     
     matches = search_players(search_q)
-    with c2:
-        if matches:
-            p = st.selectbox("Confirm Player", matches, format_func=lambda x: f"{x.first_name} {x.last_name}")
-        else:
-            st.stop()
-
-    if st.button("🚀 Analyze"):
-        log = get_player_stats(p.id)
-        if not log.empty:
-            if stat_cat == "PRA": log['PRA'] = log['PTS'] + log['REB'] + log['AST']
-            
-            avg = log[stat_cat].head(10).mean()
-            proj = avg * (1.12 if f"{p.first_name} {p.last_name}" in intel['injuries'] else 1.0)
-            prob = (1 - poisson.cdf(line - 0.5, proj)) * 100
-
-            st.divider()
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Projection", round(proj, 1))
-            m2.metric("L10 Avg", round(avg, 1))
-            m3.metric("Over Prob", f"{round(prob, 1)}%")
-
-            v1, v2 = st.columns(2)
-            with v1:
-                st.plotly_chart(px.bar(x=np.arange(max(0, int(proj-10)), int(proj+15)), 
-                                       y=poisson.pmf(np.arange(max(0, int(proj-10)), int(proj+15)), proj), 
-                                       title="Probability Curve"), use_container_width=True)
-            with v2:
-                st.plotly_chart(px.line(log.head(10).iloc[::-1], x='DATE', y=stat_cat, title="Trend"), use_container_width=True)
-
-# --- 5. TEAM SCANNER ---
-
-elif mode == "Team Scanner":
-    st.header("🔍 Value Scanner")
-    t_list = sorted([{"id": k, "name": v['full_name']} for k, v in team_map.items()], key=lambda x: x['name'])
-    sel_t = st.selectbox("Select Team", t_list, format_func=lambda x: x['name'])
     
-    if st.button("📡 Scan Roster"):
-        roster = api.nba.players.list(team_ids=[sel_t['id']])
+    if matches:
+        # format_func ensures the UI looks good while 'p' remains the object
+        p = st.selectbox("Confirm Player", matches, 
+                         format_func=lambda x: f"{x.first_name} {x.last_name} ({x.team.abbreviation if x.team else 'N/A'})")
+        
+        if st.button("🚀 Analyze"):
+            with st.spinner(f"Fetching data for {p.first_name}..."):
+                log = get_player_stats(p.id)
+                
+                if not log.empty:
+                    # Calculate PRA if selected
+                    if stat_cat == "PRA": 
+                        log['PRA'] = log['PTS'] + log['REB'] + log['AST']
+                    
+                    # Statistical Logic
+                    recent_games = log.head(10)
+                    avg = recent_games[stat_cat].mean()
+                    
+                    # Poisson Projection
+                    proj = avg * (1.12 if f"{p.first_name} {p.last_name}" in intel['injuries'] else 1.0)
+                    # Simple Poisson: Prob of getting MORE than 'line'
+                    prob = (1 - poisson.cdf(line - 0.5, proj)) * 100
+
+                    st.divider()
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Current Projection", round(proj, 1))
+                    m2.metric("L10 Average", round(avg, 1))
+                    m3.metric("Probability Over", f"{round(prob, 1)}%")
+
+                    v1, v2 = st.columns(2)
+                    with v1:
+                        # Probability Distribution Chart
+                        x_axis = np.arange(max(0, int(proj-15)), int(proj+15))
+                        y_axis = [poisson.pmf(i, proj) for i in x_axis]
+                        fig_dist = px.bar(x=x_axis, y=y_axis, title=f"{stat_cat} Probability Dist.", labels={'x':stat_cat, 'y':'Prob'})
+                        st.plotly_chart(fig_dist, use_container_width=True)
+                    with v2:
+                        # Trend Chart
+                        fig_trend = px.line(recent_games.iloc[::-1], x='DATE', y=stat_cat, title="Last 10 Games Trend", markers=True)
+                        st.plotly_chart(fig_trend, use_container_width=True)
+                else:
+                    st.warning("No recent stats found for this player in 2024-2025.")
+    else:
+        st.info("Type at least 3 characters to search for a player.")
+
+# --- 5. TEAM SCANNER (REVISED) ---
+elif mode == "Team Scanner":
+    st.header("🔍 Team Value Scanner")
+    # Clean list creation
+    t_options = {t.full_name: t.id for t in api.nba.teams.list() if t.id <= 30}
+    sel_team_name = st.selectbox("Select Team", sorted(t_options.keys()))
+    sel_team_id = t_options[sel_team_name]
+    
+    if st.button("📡 Scan Top Rotation"):
+        # We fetch players and just take a slice to avoid hitting rate limits instantly
+        roster_resp = api.nba.players.list(team_ids=[sel_team_id])
+        roster = roster_resp.data[:10] # Top 10 results from the search
+        
         scan_data = []
-        prog = st.progress(0)
+        prog_bar = st.progress(0)
+        status_text = st.empty()
         
-        for i, p in enumerate(roster.data[:8]): # Limited to top 8 players to stay safe
-            time.sleep(12) # Manual delay to stay under 5 req/min
-            p_log = get_player_stats(p.id)
+        for i, player in enumerate(roster):
+            status_text.text(f"Analyzing {player.first_name} {player.last_name}...")
+            
+            # This is the bottleneck (5 req/min). 
+            # 12 seconds per player = 5 players per minute.
+            p_log = get_player_stats(player.id)
+            
             if not p_log.empty:
-                if stat_cat == "PRA": p_log['PRA'] = p_log['PTS'] + p_log['REB'] + p_log['AST']
+                if stat_cat == "PRA": 
+                    p_log['PRA'] = p_log['PTS'] + p_log['REB'] + p_log['AST']
                 val = p_log[stat_cat].head(5).mean()
-                scan_data.append({"Player": f"{p.first_name} {p.last_name}", "Avg": round(val, 1)})
-            prog.progress((i + 1) / 8)
+                scan_data.append({
+                    "Player": f"{player.first_name} {player.last_name}", 
+                    f"L5 {stat_cat} Avg": round(val, 1),
+                    "Status": "Active"
+                })
+            
+            prog_bar.progress((i + 1) / len(roster))
+            if i < len(roster) - 1:
+                time.sleep(12) # Crucial for Free Tier
         
-        st.table(pd.DataFrame(scan_data))
+        status_text.success("Scan Complete!")
+        if scan_data:
+            st.table(pd.DataFrame(scan_data))
+        else:
+            st.error("No active stat data found for this team's roster.")
